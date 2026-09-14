@@ -1,0 +1,716 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>Model Viewer</title>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.158.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.158.0/examples/jsm/",
+    "three/examples/jsm/utils/BufferGeometryUtils": "https://unpkg.com/three@0.158.0/examples/jsm/utils/BufferGeometryUtils.js",
+    "three/examples/jsm/loaders/DRACOLoader": "https://unpkg.com/three@0.158.0/examples/jsm/loaders/DRACOLoader.js",
+    "web-ifc-three/IFCLoader": "https://unpkg.com/web-ifc-three@0.0.126/IFCLoader.js",
+    "web-ifc": "https://unpkg.com/web-ifc@0.0.36/web-ifc-api.js"
+  }
+}
+</script>
+
+<style>
+  :root{
+    --canvas: #1b1e23;
+    --panel: #23272e;
+    --panel-2: #2b303a;
+    --border: #383e48;
+    --text: #e7e9ec;
+    --text-muted: #8b93a1;
+    --accent: #4fa3d1;
+    --accent-dim: #3a7ea3;
+    --danger: #d16a4f;
+    --radius: 3px;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: var(--canvas);
+    font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: var(--text);
+  }
+
+  #app {
+    position: relative;
+    width: 100vw;
+    height: 100vh;
+  }
+
+  #viewer-container {
+    position: absolute;
+    inset: 0;
+  }
+
+  #viewer-container canvas {
+    display: block;
+    outline: none;
+  }
+
+  /* ---------- Top bar ---------- */
+  #topbar {
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 48px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    padding: 0 12px;
+    gap: 12px;
+    z-index: 20;
+  }
+
+  #topbar .mark {
+    width: 20px; height: 20px;
+    flex-shrink: 0;
+  }
+
+  #topbar .filename {
+    font-size: 13px;
+    color: var(--text-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 40vw;
+  }
+
+  #topbar .filename.has-file {
+    color: var(--text);
+  }
+
+  #topbar .spacer { flex: 1; }
+
+  .btn {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-size: 12.5px;
+    font-family: inherit;
+    padding: 7px 12px;
+    border-radius: var(--radius);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+    transition: background 0.12s ease, border-color 0.12s ease;
+  }
+  .btn:hover { background: #333944; border-color: #454c58; }
+  .btn:active { background: #2c313a; }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .btn.primary {
+    background: var(--accent-dim);
+    border-color: var(--accent);
+  }
+  .btn.primary:hover { background: var(--accent); }
+
+  .btn.active {
+    background: var(--accent-dim);
+    border-color: var(--accent);
+    color: #fff;
+  }
+
+  #file-input { display: none; }
+
+  /* ---------- Left tool rail ---------- */
+  #rail {
+    position: absolute;
+    top: 60px;
+    left: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    z-index: 20;
+  }
+
+  .rail-btn {
+    width: 34px;
+    height: 34px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-muted);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: background 0.12s ease, color 0.12s ease;
+  }
+  .rail-btn:hover { color: var(--text); background: var(--panel-2); }
+  .rail-btn.active { color: #fff; background: var(--accent-dim); border-color: var(--accent); }
+  .rail-btn svg { width: 16px; height: 16px; }
+
+  /* ---------- Drop zone / empty state ---------- */
+  #dropzone {
+    position: absolute;
+    inset: 48px 0 0 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 15;
+    pointer-events: none;
+  }
+
+  #dropzone.visible { display: flex; pointer-events: all; }
+
+  #dropzone-inner {
+    text-align: center;
+    max-width: 340px;
+    padding: 32px;
+  }
+
+  #dropzone-inner .glyph {
+    width: 40px;
+    height: 40px;
+    margin: 0 auto 18px;
+    color: var(--text-muted);
+  }
+
+  #dropzone-inner h1 {
+    font-size: 15px;
+    font-weight: 600;
+    margin: 0 0 6px;
+    color: var(--text);
+  }
+
+  #dropzone-inner p {
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--text-muted);
+    margin: 0 0 20px;
+  }
+
+  #dropzone.dragover #dropzone-inner {
+    outline: 1px dashed var(--accent);
+    outline-offset: 12px;
+  }
+
+  /* ---------- Loading ---------- */
+  #loading {
+    position: absolute;
+    inset: 0;
+    background: rgba(27, 30, 35, 0.92);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 30;
+    flex-direction: column;
+    gap: 14px;
+  }
+  #loading.visible { display: flex; }
+
+  #loading .bar-track {
+    width: 220px;
+    height: 3px;
+    background: var(--border);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  #loading .bar-fill {
+    height: 100%;
+    width: 0%;
+    background: var(--accent);
+    transition: width 0.15s ease;
+  }
+  #loading .label {
+    font-size: 12.5px;
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* ---------- Right info panel ---------- */
+  #panel {
+    position: absolute;
+    top: 60px;
+    right: 12px;
+    width: 260px;
+    max-height: calc(100vh - 84px);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    z-index: 20;
+    display: none;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  #panel.visible { display: flex; }
+
+  #panel .panel-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  #panel .panel-head span {
+    font-size: 11.5px;
+    letter-spacing: 0.02em;
+    color: var(--text-muted);
+  }
+  #panel .panel-close {
+    cursor: pointer;
+    color: var(--text-muted);
+    background: none;
+    border: none;
+    font-size: 15px;
+    line-height: 1;
+    padding: 2px 4px;
+  }
+  #panel .panel-close:hover { color: var(--text); }
+
+  #panel .panel-body {
+    padding: 12px;
+    overflow-y: auto;
+    font-size: 12.5px;
+  }
+
+  #panel .prop-type {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text);
+    margin-bottom: 2px;
+  }
+  #panel .prop-id {
+    font-family: "SFMono-Regular", ui-monospace, Menlo, monospace;
+    font-size: 11px;
+    color: var(--accent);
+    margin-bottom: 14px;
+  }
+
+  #panel .prop-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 6px 0;
+    border-top: 1px solid var(--border);
+  }
+  #panel .prop-row .k {
+    color: var(--text-muted);
+    flex-shrink: 0;
+  }
+  #panel .prop-row .v {
+    color: var(--text);
+    text-align: right;
+    word-break: break-word;
+  }
+
+  /* ---------- Bottom-left stats ---------- */
+  #stats {
+    position: absolute;
+    bottom: 10px;
+    left: 12px;
+    font-size: 11px;
+    color: var(--text-muted);
+    font-family: "SFMono-Regular", ui-monospace, Menlo, monospace;
+    z-index: 20;
+    display: none;
+  }
+  #stats.visible { display: block; }
+
+  /* ---------- Toast (errors) ---------- */
+  #toast {
+    position: absolute;
+    bottom: 16px;
+    left: 50%;
+    transform: translateX(-50%) translateY(8px);
+    background: var(--panel);
+    border: 1px solid var(--danger);
+    color: var(--text);
+    font-size: 12.5px;
+    padding: 10px 14px;
+    border-radius: var(--radius);
+    z-index: 40;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.18s ease, transform 0.18s ease;
+    max-width: 420px;
+  }
+  #toast.visible {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+</style>
+</head>
+<body>
+
+<div id="app">
+
+  <div id="viewer-container"></div>
+
+  <!-- Top bar -->
+  <div id="topbar">
+    <svg class="mark" viewBox="0 0 20 20" fill="none">
+      <path d="M10 1.5L18 6v8l-8 4.5L2 14V6l8-4.5z" stroke="#4fa3d1" stroke-width="1.3" stroke-linejoin="round"/>
+      <path d="M2 6l8 4.5L18 6M10 10.5V19" stroke="#4fa3d1" stroke-width="1.3" stroke-linejoin="round"/>
+    </svg>
+    <span id="filename" class="filename">No model loaded</span>
+    <div class="spacer"></div>
+    <button class="btn" id="btn-reset" title="Reset view" disabled>Reset view</button>
+    <button class="btn primary" id="btn-open">Open IFC file</button>
+    <input type="file" id="file-input" accept=".ifc" />
+  </div>
+
+  <!-- Left tool rail -->
+  <div id="rail">
+    <div class="rail-btn" id="tool-wireframe" title="Toggle wireframe">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M12 2l9 5v10l-9 5-9-5V7l9-5z"/><path d="M3 7l9 5 9-5M12 12v10"/></svg>
+    </div>
+    <div class="rail-btn" id="tool-sections" title="Toggle transparency">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="3" y="3" width="18" height="18" rx="1"/><path d="M3 9h18M3 15h18"/></svg>
+    </div>
+    <div class="rail-btn" id="tool-fit" title="Fit to view">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
+    </div>
+  </div>
+
+  <!-- Drop zone / empty state -->
+  <div id="dropzone" class="visible">
+    <div id="dropzone-inner">
+      <svg class="glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2">
+        <path d="M12 2l9 5v10l-9 5-9-5V7l9-5z"/>
+        <path d="M3 7l9 5 9-5M12 12v10M7.5 4.5l9 5M16.5 4.5l-9 5"/>
+      </svg>
+      <h1>Drop an IFC file to view it</h1>
+      <p>Drag an .ifc file anywhere on this window, or open one from your computer. Nothing is uploaded — the model is parsed locally in your browser.</p>
+      <button class="btn primary" id="btn-open-empty">Choose file</button>
+    </div>
+  </div>
+
+  <!-- Loading -->
+  <div id="loading">
+    <div class="bar-track"><div class="bar-fill" id="bar-fill"></div></div>
+    <div class="label" id="loading-label">Reading geometry…</div>
+  </div>
+
+  <!-- Right info panel -->
+  <div id="panel">
+    <div class="panel-head">
+      <span>ELEMENT</span>
+      <button class="panel-close" id="panel-close">&times;</button>
+    </div>
+    <div class="panel-body" id="panel-body"></div>
+  </div>
+
+  <!-- Stats -->
+  <div id="stats"></div>
+
+  <!-- Toast -->
+  <div id="toast"></div>
+
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { IFCLoader } from 'web-ifc-three/IFCLoader';
+
+// ---------- Teams SDK (optional context, no-op outside Teams) ----------
+(function initTeams() {
+  const script = document.createElement('script');
+  script.src = 'https://res.cdn.office.net/teams-js/2.19.0/js/MicrosoftTeams.min.js';
+  script.onload = () => {
+    try {
+      window.microsoftTeams.app.initialize().then(() => {
+        window.microsoftTeams.app.notifySuccess();
+      }).catch(() => {});
+    } catch (e) { /* not running inside Teams */ }
+  };
+  document.head.appendChild(script);
+})();
+
+// ---------- Scene setup ----------
+const container = document.getElementById('viewer-container');
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1b1e23);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 5000);
+camera.position.set(18, 14, 18);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+container.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.target.set(0, 0, 0);
+
+// Lighting: neutral three-point setup so materials read consistently
+const hemi = new THREE.HemisphereLight(0xdfe6ee, 0x1a1c20, 0.9);
+scene.add(hemi);
+const key = new THREE.DirectionalLight(0xffffff, 1.0);
+key.position.set(20, 30, 10);
+scene.add(key);
+const fill = new THREE.DirectionalLight(0xffffff, 0.35);
+fill.position.set(-20, 10, -15);
+scene.add(fill);
+
+const grid = new THREE.GridHelper(60, 60, 0x343a42, 0x2a2e35);
+grid.position.y = 0;
+scene.add(grid);
+
+function resize() {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+}
+window.addEventListener('resize', resize);
+
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+
+// ---------- IFC loader ----------
+const ifcLoader = new IFCLoader();
+ifcLoader.ifcManager.setWasmPath('https://unpkg.com/web-ifc@0.0.36/');
+ifcLoader.ifcManager.applyWebIfcConfig({ COORDINATE_TO_ORIGIN: true, USE_FAST_BOOLS: true });
+
+let currentModel = null;
+let wireframeOn = false;
+let transparentOn = false;
+
+// ---------- UI refs ----------
+const fileInput = document.getElementById('file-input');
+const btnOpen = document.getElementById('btn-open');
+const btnOpenEmpty = document.getElementById('btn-open-empty');
+const btnReset = document.getElementById('btn-reset');
+const filenameEl = document.getElementById('filename');
+const dropzone = document.getElementById('dropzone');
+const loading = document.getElementById('loading');
+const barFill = document.getElementById('bar-fill');
+const loadingLabel = document.getElementById('loading-label');
+const statsEl = document.getElementById('stats');
+const toast = document.getElementById('toast');
+const panel = document.getElementById('panel');
+const panelBody = document.getElementById('panel-body');
+const panelClose = document.getElementById('panel-close');
+const toolWireframe = document.getElementById('tool-wireframe');
+const toolSections = document.getElementById('tool-sections');
+const toolFit = document.getElementById('tool-fit');
+
+btnOpen.addEventListener('click', () => fileInput.click());
+btnOpenEmpty.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', (e) => {
+  if (e.target.files.length) loadFile(e.target.files[0]);
+});
+
+// Drag & drop across the whole window.
+// The big empty-state panel is only shown pre-drop when no model is loaded yet;
+// once a model exists, dropping a new file still works, it just doesn't cover the view.
+['dragenter', 'dragover'].forEach(evt => {
+  window.addEventListener(evt, (e) => {
+    e.preventDefault();
+    if (!currentModel) dropzone.classList.add('visible');
+    dropzone.classList.add('dragover');
+  });
+});
+['dragleave', 'drop'].forEach(evt => {
+  window.addEventListener(evt, (e) => {
+    e.preventDefault();
+    if (evt === 'dragleave' && e.target !== dropzone) return;
+    dropzone.classList.remove('dragover');
+    if (currentModel) dropzone.classList.remove('visible');
+  });
+});
+window.addEventListener('drop', (e) => {
+  e.preventDefault();
+  const file = e.dataTransfer.files[0];
+  if (file) loadFile(file);
+});
+
+panelClose.addEventListener('click', () => panel.classList.remove('visible'));
+
+btnReset.addEventListener('click', () => fitCameraToModel());
+toolFit.addEventListener('click', () => fitCameraToModel());
+
+toolWireframe.addEventListener('click', () => {
+  if (!currentModel) return;
+  wireframeOn = !wireframeOn;
+  toolWireframe.classList.toggle('active', wireframeOn);
+  currentModel.traverse((child) => {
+    if (child.isMesh) {
+      const mats = Array.isArray(child.material) ? child.material : [child.material];
+      mats.forEach((m) => { m.wireframe = wireframeOn; });
+    }
+  });
+});
+
+toolSections.addEventListener('click', () => {
+  if (!currentModel) return;
+  transparentOn = !transparentOn;
+  toolSections.classList.toggle('active', transparentOn);
+  currentModel.traverse((child) => {
+    if (child.isMesh) {
+      const mats = Array.isArray(child.material) ? child.material : [child.material];
+      mats.forEach((m) => {
+        m.transparent = transparentOn;
+        m.opacity = transparentOn ? 0.35 : 1;
+      });
+    }
+  });
+});
+
+function showToast(msg) {
+  toast.textContent = msg;
+  toast.classList.add('visible');
+  setTimeout(() => toast.classList.remove('visible'), 4200);
+}
+
+function setProgress(pct, label) {
+  barFill.style.width = Math.min(pct, 100) + '%';
+  if (label) loadingLabel.textContent = label;
+}
+
+async function loadFile(file) {
+  if (!file.name.toLowerCase().endsWith('.ifc')) {
+    showToast('That file doesn\'t look like an IFC model (.ifc).');
+    return;
+  }
+
+  dropzone.classList.remove('visible');
+  loading.classList.add('visible');
+  setProgress(5, 'Reading file…');
+
+  try {
+    const url = URL.createObjectURL(file);
+
+    ifcLoader.ifcManager.setOnProgress((event) => {
+      const pct = event.total ? (event.loaded / event.total) * 100 : 40;
+      setProgress(pct, 'Parsing geometry…');
+    });
+
+    const model = await ifcLoader.loadAsync(url);
+
+    if (currentModel) {
+      scene.remove(currentModel);
+    }
+
+    scene.add(model);
+    currentModel = model;
+
+    setProgress(100, 'Done');
+    filenameEl.textContent = file.name;
+    filenameEl.classList.add('has-file');
+    btnReset.disabled = false;
+    statsEl.classList.add('visible');
+    statsEl.textContent = file.name.toUpperCase();
+
+    fitCameraToModel();
+    setupPicking(model);
+
+    URL.revokeObjectURL(url);
+  } catch (err) {
+    console.error(err);
+    showToast('Could not load that model. It may be an unsupported IFC schema or a corrupted file.');
+    dropzone.classList.add('visible');
+  } finally {
+    setTimeout(() => loading.classList.remove('visible'), 250);
+  }
+}
+
+function fitCameraToModel() {
+  if (!currentModel) return;
+  const box = new THREE.Box3().setFromObject(currentModel);
+  const size = box.getSize(new THREE.Vector3());
+  const center = box.getCenter(new THREE.Vector3());
+
+  const maxDim = Math.max(size.x, size.y, size.z) || 10;
+  const dist = maxDim * 1.6;
+
+  camera.position.set(center.x + dist, center.y + dist * 0.75, center.z + dist);
+  camera.near = maxDim / 100;
+  camera.far = maxDim * 50;
+  camera.updateProjectionMatrix();
+
+  controls.target.copy(center);
+  controls.update();
+
+  grid.position.y = box.min.y;
+}
+
+// ---------- Element picking ----------
+const raycaster = new THREE.Raycaster();
+const pointer = new THREE.Vector2();
+
+function setupPicking(model) {
+  renderer.domElement.addEventListener('click', onPick);
+}
+
+async function onPick(event) {
+  if (!currentModel) return;
+  const rect = renderer.domElement.getBoundingClientRect();
+  pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+  pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+  raycaster.setFromCamera(pointer, camera);
+  const intersects = raycaster.intersectObject(currentModel, true);
+  if (!intersects.length) {
+    panel.classList.remove('visible');
+    return;
+  }
+
+  const hit = intersects[0];
+  const faceIndex = hit.faceIndex;
+  const modelID = currentModel.modelID;
+
+  try {
+    const expressID = ifcLoader.ifcManager.getExpressId(currentModel.geometry, faceIndex);
+    const props = await ifcLoader.ifcManager.getItemProperties(modelID, expressID, false);
+    renderProps(props, expressID);
+  } catch (err) {
+    console.error(err);
+  }
+}
+
+function renderProps(props, expressID) {
+  const type = props.constructor && props.constructor.name ? props.constructor.name : 'Element';
+  const name = props.Name && props.Name.value ? props.Name.value : '—';
+
+  let html = `<div class="prop-type">${escapeHtml(name)}</div>`;
+  html += `<div class="prop-id">Express ID ${expressID}</div>`;
+
+  const rows = [
+    ['Type', props.constructor?.name ?? '—'],
+    ['GlobalId', props.GlobalId?.value ?? '—'],
+    ['ObjectType', props.ObjectType?.value ?? '—'],
+    ['Description', props.Description?.value ?? '—'],
+    ['Tag', props.Tag?.value ?? '—'],
+  ];
+
+  for (const [k, v] of rows) {
+    html += `<div class="prop-row"><span class="k">${k}</span><span class="v">${escapeHtml(String(v))}</span></div>`;
+  }
+
+  panelBody.innerHTML = html;
+  panel.classList.add('visible');
+}
+
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+</script>
+</body>
+</html>
