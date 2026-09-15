@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-<title>Model Viewer</title>
+<title>RSP IFC-SG Viewer &amp; Checker</title>
 
 <script type="importmap">
 {
@@ -23,328 +23,418 @@
     --canvas: #1b1e23;
     --panel: #23272e;
     --panel-2: #2b303a;
+    --panel-3: #31374180;
     --border: #383e48;
     --text: #e7e9ec;
     --text-muted: #8b93a1;
+    --text-dim: #6b7382;
     --accent: #4fa3d1;
     --accent-dim: #3a7ea3;
     --danger: #d16a4f;
+    --warn: #d4a13c;
+    --ok: #5aa65a;
     --radius: 3px;
   }
 
   * { box-sizing: border-box; }
 
   html, body {
-    margin: 0;
-    padding: 0;
-    width: 100%;
-    height: 100%;
+    margin: 0; padding: 0; width: 100%; height: 100%;
     overflow: hidden;
     background: var(--canvas);
     font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     color: var(--text);
+    font-size: 13px;
   }
 
-  #app {
-    position: relative;
-    width: 100vw;
-    height: 100vh;
-  }
+  #app { position: relative; width: 100vw; height: 100vh; }
 
-  #viewer-container {
-    position: absolute;
-    inset: 0;
-  }
-
-  #viewer-container canvas {
-    display: block;
-    outline: none;
-  }
+  #viewer-container { position: absolute; inset: 48px 0 0 0; }
+  #viewer-container canvas { display: block; outline: none; }
 
   /* ---------- Top bar ---------- */
   #topbar {
-    position: absolute;
-    top: 0; left: 0; right: 0;
-    height: 48px;
-    background: var(--panel);
-    border-bottom: 1px solid var(--border);
-    display: flex;
-    align-items: center;
-    padding: 0 12px;
-    gap: 12px;
-    z-index: 20;
+    position: absolute; top: 0; left: 0; right: 0; height: 48px;
+    background: var(--panel); border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; padding: 0 12px; gap: 12px; z-index: 30;
   }
-
-  #topbar .mark {
-    width: 20px; height: 20px;
-    flex-shrink: 0;
-  }
-
+  #topbar .mark { width: 20px; height: 20px; flex-shrink: 0; }
   #topbar .filename {
-    font-size: 13px;
-    color: var(--text-muted);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    max-width: 40vw;
+    font-size: 13px; color: var(--text-muted);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 28vw;
   }
-
-  #topbar .filename.has-file {
-    color: var(--text);
-  }
-
+  #topbar .filename.has-file { color: var(--text); }
   #topbar .spacer { flex: 1; }
 
+  .ruleset-badge {
+    font-size: 11px; color: var(--text-dim);
+    border: 1px solid var(--border); border-radius: 999px;
+    padding: 3px 9px; white-space: nowrap;
+  }
+  .ruleset-badge b { color: var(--text-muted); font-weight: 600; }
+  .ruleset-badge.err { border-color: var(--danger); color: var(--danger); }
+
   .btn {
-    background: var(--panel-2);
-    border: 1px solid var(--border);
-    color: var(--text);
-    font-size: 12.5px;
-    font-family: inherit;
-    padding: 7px 12px;
-    border-radius: var(--radius);
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    white-space: nowrap;
-    transition: background 0.12s ease, border-color 0.12s ease;
+    background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+    font-size: 12.5px; font-family: inherit; padding: 7px 12px;
+    border-radius: var(--radius); cursor: pointer;
+    display: flex; align-items: center; gap: 6px; white-space: nowrap;
+    transition: background .12s ease, border-color .12s ease;
   }
   .btn:hover { background: #333944; border-color: #454c58; }
-  .btn:active { background: #2c313a; }
-  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
-
-  .btn.primary {
-    background: var(--accent-dim);
-    border-color: var(--accent);
-  }
+  .btn:disabled { opacity: .4; cursor: not-allowed; }
+  .btn.primary { background: var(--accent-dim); border-color: var(--accent); }
   .btn.primary:hover { background: var(--accent); }
-
-  .btn.active {
-    background: var(--accent-dim);
-    border-color: var(--accent);
-    color: #fff;
-  }
+  .btn.sm { padding: 5px 9px; font-size: 11.5px; }
 
   #file-input { display: none; }
 
-  /* ---------- Left tool rail ---------- */
-  #rail {
-    position: absolute;
-    top: 60px;
-    left: 12px;
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    z-index: 20;
+  /* ---------- Left query panel ---------- */
+  #left {
+    position: absolute; top: 60px; left: 12px; bottom: 12px; width: 330px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+    z-index: 20; display: flex; flex-direction: column; overflow: hidden;
+  }
+  #left.collapsed { width: 40px; }
+  #left.collapsed > *:not(.tabs) { display: none; }
+  #left.collapsed .tabs button span { display: none; }
+
+  .tabs { display: flex; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+  .tabs button {
+    flex: 1; background: none; border: none; border-bottom: 2px solid transparent;
+    color: var(--text-muted); font-family: inherit; font-size: 11.5px;
+    letter-spacing: .04em; padding: 10px 6px; cursor: pointer;
+  }
+  .tabs button:hover { color: var(--text); }
+  .tabs button.active { color: var(--text); border-bottom-color: var(--accent); }
+
+  .filters {
+    display: flex; gap: 6px; padding: 10px; border-bottom: 1px solid var(--border);
+    flex-wrap: wrap; flex-shrink: 0;
+  }
+  .filters select, .filters input {
+    background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+    font-family: inherit; font-size: 12px; padding: 5px 7px; border-radius: var(--radius);
+    min-width: 0;
+  }
+  .filters select { flex: 1; }
+  .filters input { flex: 1 1 100%; }
+  .filters label {
+    display: flex; align-items: center; gap: 5px;
+    font-size: 11.5px; color: var(--text-muted); cursor: pointer;
   }
 
+  .scroll { overflow-y: auto; overflow-x: hidden; flex: 1; }
+  .scroll::-webkit-scrollbar { width: 9px; }
+  .scroll::-webkit-scrollbar-thumb { background: #3c434e; border-radius: 5px; }
+  .scroll::-webkit-scrollbar-track { background: transparent; }
+
+  /* Query tree */
+  .grp-head {
+    padding: 7px 10px 5px; font-size: 10.5px; letter-spacing: .06em;
+    color: var(--text-dim); background: var(--panel);
+    position: sticky; top: 0; border-bottom: 1px solid var(--border); z-index: 1;
+  }
+
+  .target {
+    border-bottom: 1px solid #2e333c;
+  }
+  .target-head {
+    display: flex; align-items: center; gap: 7px; padding: 7px 10px;
+    cursor: pointer; user-select: none;
+  }
+  .target-head:hover { background: var(--panel-2); }
+  .target.sel > .target-head { background: #2e4456; }
+  .target-head .caret {
+    color: var(--text-dim); font-size: 9px; width: 8px; flex-shrink: 0;
+    transition: transform .12s ease;
+  }
+  .target.open .caret { transform: rotate(90deg); }
+  .target-head .tname { flex: 1; font-size: 12.5px; min-width: 0; }
+  .target-head .tname small { display: block; color: var(--text-dim); font-size: 10.5px; }
+  .target-head .count {
+    font-size: 11px; color: var(--text-muted); font-variant-numeric: tabular-nums;
+    background: var(--panel-2); border-radius: 999px; padding: 1px 7px; flex-shrink: 0;
+  }
+  .target.zero .target-head { opacity: .42; }
+
+  .reqs { display: none; padding: 0 0 5px; }
+  .target.open .reqs { display: block; }
+  .req {
+    display: flex; align-items: center; gap: 7px;
+    padding: 5px 10px 5px 25px; cursor: pointer; font-size: 12px;
+  }
+  .req:hover { background: var(--panel-2); }
+  .req.sel { background: #2e4456; }
+  .req .rname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .req .rpset { color: var(--text-dim); font-size: 10.5px; }
+  .req .chip {
+    font-size: 9.5px; color: var(--text-dim); border: 1px solid var(--border);
+    border-radius: 2px; padding: 0 4px; flex-shrink: 0;
+  }
+
+  /* Legend */
+  #legend {
+    border-top: 1px solid var(--border); flex-shrink: 0;
+    max-height: 45%; display: none; flex-direction: column;
+  }
+  #legend.visible { display: flex; }
+  .legend-head {
+    display: flex; align-items: center; gap: 8px; padding: 8px 10px;
+    border-bottom: 1px solid var(--border);
+  }
+  .legend-head .lt { flex: 1; font-size: 11.5px; min-width: 0; }
+  .legend-head .lt small { display: block; color: var(--text-dim); font-size: 10.5px; }
+  .legend-rows { overflow-y: auto; padding: 4px 0; }
+  .lrow {
+    display: flex; align-items: center; gap: 8px; padding: 4px 10px;
+    cursor: pointer; font-size: 12px;
+  }
+  .lrow:hover { background: var(--panel-2); }
+  .lrow.muted { opacity: .35; }
+  .lrow .sw { width: 11px; height: 11px; border-radius: 2px; flex-shrink: 0; }
+  .lrow .lv { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .lrow .lc { color: var(--text-muted); font-variant-numeric: tabular-nums; font-size: 11px; }
+
+  /* Check tab */
+  .check-actions { padding: 10px; border-bottom: 1px solid var(--border); display: flex; gap: 6px; }
+  .summary { padding: 10px; border-bottom: 1px solid var(--border); display: none; }
+  .summary.visible { display: block; }
+  .sbar { display: flex; height: 6px; border-radius: 3px; overflow: hidden; margin-bottom: 8px; background: var(--panel-2); }
+  .sbar i { display: block; height: 100%; }
+  .sgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 3px 10px; font-size: 11.5px; }
+  .sgrid .k { color: var(--text-muted); }
+  .sgrid .v { text-align: right; font-variant-numeric: tabular-nums; }
+
+  .issue-target { border-bottom: 1px solid #2e333c; }
+  .issue-head {
+    display: flex; align-items: center; gap: 7px; padding: 7px 10px; cursor: pointer;
+  }
+  .issue-head:hover { background: var(--panel-2); }
+  .issue-head .iname { flex: 1; font-size: 12.5px; min-width: 0; }
+  .issue-head .iname small { display: block; color: var(--text-dim); font-size: 10.5px; }
+  .issue-head .pill {
+    font-size: 10.5px; padding: 1px 7px; border-radius: 999px;
+    font-variant-numeric: tabular-nums; flex-shrink: 0;
+  }
+  .pill.bad { background: #4a2a22; color: #e59277; }
+  .pill.good { background: #27402a; color: #86c086; }
+  .issue-body { display: none; padding: 0 10px 8px 25px; }
+  .issue-target.open .issue-body { display: block; }
+  .ilist { font-size: 11.5px; }
+  .ilist .irow {
+    display: flex; gap: 7px; padding: 3px 0; border-top: 1px solid #2e333c;
+    align-items: baseline;
+  }
+  .ilist .irow .ik { flex: 1; color: var(--text-muted); min-width: 0; }
+  .ilist .irow .iv { color: var(--text-dim); font-variant-numeric: tabular-nums; }
+  .status-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; margin-top: 4px; }
+
+  .empty-note { padding: 18px 14px; color: var(--text-dim); font-size: 12px; line-height: 1.55; }
+
+  /* ---------- Loaded models strip ---------- */
+  #models { border-bottom: 1px solid var(--border); flex-shrink: 0; max-height: 132px; overflow-y: auto; }
+  #models:empty { display: none; }
+  .mrow {
+    display: flex; align-items: center; gap: 7px; padding: 6px 10px;
+    border-bottom: 1px solid #2e333c; font-size: 12px;
+  }
+  .mrow:last-child { border-bottom: none; }
+  .mrow.off .mname { opacity: .4; }
+  .mrow .mname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mrow .mname small { display: block; color: var(--text-dim); font-size: 10.5px; }
+  .mrow .icon-btn {
+    background: none; border: none; color: var(--text-dim); cursor: pointer;
+    padding: 2px 3px; line-height: 1; font-size: 13px; flex-shrink: 0;
+  }
+  .mrow .icon-btn:hover { color: var(--text); }
+  .mrow .icon-btn.on { color: var(--accent); }
+  .mrow .icon-btn svg { width: 14px; height: 14px; display: block; }
+
+  /* ---------- Dashboard overlay ---------- */
+  #dash {
+    position: absolute; inset: 48px 0 0 0; z-index: 45;
+    background: var(--canvas); display: none; flex-direction: column;
+  }
+  #dash.visible { display: flex; }
+  .dash-head {
+    display: flex; align-items: center; gap: 14px;
+    padding: 14px 20px; border-bottom: 1px solid var(--border); flex-shrink: 0;
+  }
+  .dash-head h2 { font-size: 15px; font-weight: 600; margin: 0; }
+  .dash-head .sub { font-size: 12px; color: var(--text-dim); }
+  .dash-head .spacer { flex: 1; }
+  .seg { display: flex; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+  .seg button {
+    background: var(--panel); border: none; color: var(--text-muted);
+    font-family: inherit; font-size: 12px; padding: 6px 12px; cursor: pointer;
+  }
+  .seg button.active { background: var(--accent-dim); color: #fff; }
+
+  .dash-body { overflow-y: auto; padding: 16px 20px 28px; }
+
+  .dash-alert {
+    border: 1px solid var(--danger); border-left-width: 3px; border-radius: var(--radius);
+    background: #2c1f1b; padding: 10px 14px; margin-bottom: 16px; font-size: 12.5px;
+  }
+  .dash-alert.warn { border-color: var(--warn); background: #2b2519; }
+  .dash-alert b { font-weight: 600; }
+  .dash-alert ul { margin: 6px 0 0; padding-left: 18px; color: var(--text-muted); }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 14px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: var(--radius); display: flex; flex-direction: column; overflow: hidden;
+  }
+  .card.absent { border-color: #5a3a30; }
+  .card-head { padding: 12px 14px 10px; border-bottom: 1px solid var(--border); }
+  .card-head .ct { display: flex; align-items: baseline; gap: 8px; }
+  .card-head h3 { font-size: 12.5px; font-weight: 600; margin: 0; flex: 1; }
+  .card-head .flag {
+    font-size: 10px; padding: 1px 7px; border-radius: 999px; white-space: nowrap;
+    background: #4a2a22; color: #e59277;
+  }
+  .card-head .flag.ok { background: #27402a; color: #86c086; }
+  .card-head .flag.partial { background: #3a3220; color: #d9b968; }
+  .card-val {
+    font-size: 25px; font-weight: 300; margin: 9px 0 2px;
+    font-variant-numeric: tabular-nums; letter-spacing: -0.01em;
+  }
+  .card-val small { font-size: 13px; color: var(--text-muted); margin-left: 5px; font-weight: 400; }
+  .card-val.none { color: var(--text-dim); }
+  .card-meta { font-size: 11px; color: var(--text-dim); }
+  .card-src {
+    font-size: 10.5px; color: var(--text-dim); padding: 7px 14px;
+    border-top: 1px solid #2e333c; background: #1f232a; line-height: 1.5;
+  }
+  .card-body { padding: 4px 0 6px; }
+  .brk-title {
+    font-size: 10px; letter-spacing: .06em; color: var(--text-dim);
+    padding: 8px 14px 4px;
+  }
+  .brk { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .brk tr { border-top: 1px solid #2e333c; }
+  .brk tr:hover { background: var(--panel-2); }
+  .brk td { padding: 4px 14px; }
+  .brk td.k { color: var(--text-muted); }
+  .brk td.n { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .brk td.c { text-align: right; color: var(--text-dim); font-size: 11px; width: 52px; }
+  .card-actions { padding: 8px 14px 12px; display: flex; gap: 6px; }
+  .card-empty { padding: 12px 14px 14px; font-size: 12px; color: var(--text-dim); line-height: 1.5; }
+
+  /* ---------- Context menu ---------- */
+  #ctxmenu {
+    position: absolute; z-index: 60; min-width: 196px;
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 4px 0; display: none;
+    box-shadow: 0 6px 22px rgba(0,0,0,.45);
+  }
+  #ctxmenu.visible { display: block; }
+  #ctxmenu .ctx-head {
+    padding: 6px 12px 7px; border-bottom: 1px solid var(--border); margin-bottom: 4px;
+    font-size: 12px; max-width: 260px;
+  }
+  #ctxmenu .ctx-head small { display: block; color: var(--text-dim); font-size: 10.5px; }
+  #ctxmenu button {
+    display: block; width: 100%; text-align: left; background: none; border: none;
+    color: var(--text); font-family: inherit; font-size: 12.5px;
+    padding: 6px 12px; cursor: pointer;
+  }
+  #ctxmenu button:hover:not(:disabled) { background: var(--accent-dim); }
+  #ctxmenu button:disabled { color: var(--text-dim); cursor: default; }
+  #ctxmenu button .hint { float: right; color: var(--text-dim); font-size: 11px; }
+  #ctxmenu button:hover:not(:disabled) .hint { color: #cfe3ef; }
+  #ctxmenu .sep { height: 1px; background: var(--border); margin: 4px 0; }
+
+  /* ---------- Right info panel ---------- */
+  #panel {
+    position: absolute; top: 60px; right: 12px; width: 300px;
+    max-height: calc(100vh - 84px);
+    background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+    z-index: 20; display: none; flex-direction: column; overflow: hidden;
+  }
+  #panel.visible { display: flex; }
+  #panel .panel-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 12px; border-bottom: 1px solid var(--border);
+  }
+  #panel .panel-head span { font-size: 11.5px; letter-spacing: .02em; color: var(--text-muted); }
+  #panel .panel-close {
+    cursor: pointer; color: var(--text-muted); background: none; border: none;
+    font-size: 15px; line-height: 1; padding: 2px 4px;
+  }
+  #panel .panel-close:hover { color: var(--text); }
+  #panel .panel-body { padding: 12px; overflow-y: auto; font-size: 12.5px; }
+
+  .prop-type { font-size: 14px; font-weight: 600; margin-bottom: 2px; }
+  .prop-id {
+    font-family: "SFMono-Regular", ui-monospace, Menlo, monospace;
+    font-size: 11px; color: var(--accent); margin-bottom: 12px;
+  }
+  .prop-row { display: flex; justify-content: space-between; gap: 10px; padding: 5px 0; border-top: 1px solid var(--border); }
+  .prop-row .k { color: var(--text-muted); flex-shrink: 0; }
+  .prop-row .v { text-align: right; word-break: break-word; }
+  .sec-head {
+    font-size: 10.5px; letter-spacing: .06em; color: var(--text-dim);
+    margin: 14px 0 4px; padding-top: 10px; border-top: 1px solid var(--border);
+  }
+  .pset-name { font-size: 11.5px; color: var(--accent); margin: 9px 0 2px; }
+  .chk-row { display: flex; gap: 7px; padding: 4px 0; align-items: baseline; border-top: 1px solid #2e333c; }
+  .chk-row .ck { flex: 1; min-width: 0; }
+  .chk-row .ck small { display: block; color: var(--text-dim); font-size: 10.5px; }
+  .chk-row .cv { text-align: right; word-break: break-word; max-width: 45%; }
+
+  /* ---------- Left tool rail ---------- */
+  #rail {
+    position: absolute; top: 60px; left: 354px;
+    display: flex; flex-direction: column; gap: 6px; z-index: 20;
+  }
+  #left.collapsed ~ #rail { left: 64px; }
   .rail-btn {
-    width: 34px;
-    height: 34px;
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    color: var(--text-muted);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    cursor: pointer;
-    transition: background 0.12s ease, color 0.12s ease;
+    width: 34px; height: 34px; background: var(--panel);
+    border: 1px solid var(--border); border-radius: var(--radius);
+    color: var(--text-muted); display: flex; align-items: center; justify-content: center;
+    cursor: pointer; transition: background .12s ease, color .12s ease;
   }
   .rail-btn:hover { color: var(--text); background: var(--panel-2); }
   .rail-btn.active { color: #fff; background: var(--accent-dim); border-color: var(--accent); }
   .rail-btn svg { width: 16px; height: 16px; }
 
-  /* ---------- Drop zone / empty state ---------- */
+  /* ---------- Drop zone ---------- */
   #dropzone {
-    position: absolute;
-    inset: 48px 0 0 0;
-    display: none;
-    align-items: center;
-    justify-content: center;
-    z-index: 15;
-    pointer-events: none;
+    position: absolute; inset: 48px 0 0 0; display: none;
+    align-items: center; justify-content: center; z-index: 25; pointer-events: none;
+    background: rgba(27,30,35,.6);
   }
-
   #dropzone.visible { display: flex; pointer-events: all; }
-
-  #dropzone-inner {
-    text-align: center;
-    max-width: 340px;
-    padding: 32px;
-  }
-
-  #dropzone-inner .glyph {
-    width: 40px;
-    height: 40px;
-    margin: 0 auto 18px;
-    color: var(--text-muted);
-  }
-
-  #dropzone-inner h1 {
-    font-size: 15px;
-    font-weight: 600;
-    margin: 0 0 6px;
-    color: var(--text);
-  }
-
-  #dropzone-inner p {
-    font-size: 13px;
-    line-height: 1.5;
-    color: var(--text-muted);
-    margin: 0 0 20px;
-  }
-
-  #dropzone.dragover #dropzone-inner {
-    outline: 1px dashed var(--accent);
-    outline-offset: 12px;
-  }
+  #dropzone-inner { text-align: center; max-width: 360px; padding: 32px; }
+  #dropzone-inner .glyph { width: 40px; height: 40px; margin: 0 auto 18px; color: var(--text-muted); }
+  #dropzone-inner h1 { font-size: 15px; font-weight: 600; margin: 0 0 6px; }
+  #dropzone-inner p { font-size: 13px; line-height: 1.55; color: var(--text-muted); margin: 0 0 20px; }
+  #dropzone.dragover #dropzone-inner { outline: 1px dashed var(--accent); outline-offset: 12px; }
+  #dropzone-inner .btn { margin: 0 auto; }
 
   /* ---------- Loading ---------- */
   #loading {
-    position: absolute;
-    inset: 0;
-    background: rgba(27, 30, 35, 0.92);
-    display: none;
-    align-items: center;
-    justify-content: center;
-    z-index: 30;
-    flex-direction: column;
-    gap: 14px;
+    position: absolute; inset: 48px 0 0 0; background: rgba(27,30,35,.92);
+    display: none; align-items: center; justify-content: center; z-index: 35;
+    flex-direction: column; gap: 14px;
   }
   #loading.visible { display: flex; }
+  #loading .bar-track { width: 220px; height: 3px; background: var(--border); border-radius: 2px; overflow: hidden; }
+  #loading .bar-fill { height: 100%; width: 0; background: var(--accent); transition: width .15s ease; }
+  #loading .label { font-size: 12.5px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
 
-  #loading .bar-track {
-    width: 220px;
-    height: 3px;
-    background: var(--border);
-    border-radius: 2px;
-    overflow: hidden;
-  }
-  #loading .bar-fill {
-    height: 100%;
-    width: 0%;
-    background: var(--accent);
-    transition: width 0.15s ease;
-  }
-  #loading .label {
-    font-size: 12.5px;
-    color: var(--text-muted);
-    font-variant-numeric: tabular-nums;
-  }
-
-  /* ---------- Right info panel ---------- */
-  #panel {
-    position: absolute;
-    top: 60px;
-    right: 12px;
-    width: 260px;
-    max-height: calc(100vh - 84px);
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    z-index: 20;
-    display: none;
-    flex-direction: column;
-    overflow: hidden;
-  }
-  #panel.visible { display: flex; }
-
-  #panel .panel-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 10px 12px;
-    border-bottom: 1px solid var(--border);
-  }
-  #panel .panel-head span {
-    font-size: 11.5px;
-    letter-spacing: 0.02em;
-    color: var(--text-muted);
-  }
-  #panel .panel-close {
-    cursor: pointer;
-    color: var(--text-muted);
-    background: none;
-    border: none;
-    font-size: 15px;
-    line-height: 1;
-    padding: 2px 4px;
-  }
-  #panel .panel-close:hover { color: var(--text); }
-
-  #panel .panel-body {
-    padding: 12px;
-    overflow-y: auto;
-    font-size: 12.5px;
-  }
-
-  #panel .prop-type {
-    font-size: 14px;
-    font-weight: 600;
-    color: var(--text);
-    margin-bottom: 2px;
-  }
-  #panel .prop-id {
-    font-family: "SFMono-Regular", ui-monospace, Menlo, monospace;
-    font-size: 11px;
-    color: var(--accent);
-    margin-bottom: 14px;
-  }
-
-  #panel .prop-row {
-    display: flex;
-    justify-content: space-between;
-    gap: 10px;
-    padding: 6px 0;
-    border-top: 1px solid var(--border);
-  }
-  #panel .prop-row .k {
-    color: var(--text-muted);
-    flex-shrink: 0;
-  }
-  #panel .prop-row .v {
-    color: var(--text);
-    text-align: right;
-    word-break: break-word;
-  }
-
-  /* ---------- Bottom-left stats ---------- */
-  #stats {
-    position: absolute;
-    bottom: 10px;
-    left: 12px;
-    font-size: 11px;
-    color: var(--text-muted);
-    font-family: "SFMono-Regular", ui-monospace, Menlo, monospace;
-    z-index: 20;
-    display: none;
-  }
-  #stats.visible { display: block; }
-
-  /* ---------- Toast (errors) ---------- */
+  /* ---------- Toast ---------- */
   #toast {
-    position: absolute;
-    bottom: 16px;
-    left: 50%;
+    position: absolute; bottom: 16px; left: 50%;
     transform: translateX(-50%) translateY(8px);
-    background: var(--panel);
-    border: 1px solid var(--danger);
-    color: var(--text);
-    font-size: 12.5px;
-    padding: 10px 14px;
-    border-radius: var(--radius);
-    z-index: 40;
-    opacity: 0;
-    pointer-events: none;
-    transition: opacity 0.18s ease, transform 0.18s ease;
-    max-width: 420px;
+    background: var(--panel); border: 1px solid var(--danger); color: var(--text);
+    font-size: 12.5px; padding: 10px 14px; border-radius: var(--radius);
+    z-index: 40; opacity: 0; pointer-events: none;
+    transition: opacity .18s ease, transform .18s ease; max-width: 460px;
   }
-  #toast.visible {
-    opacity: 1;
-    transform: translateX(-50%) translateY(0);
-  }
+  #toast.visible { opacity: 1; transform: translateX(-50%) translateY(0); }
 </style>
 </head>
 <body>
@@ -361,33 +451,81 @@
     </svg>
     <span id="filename" class="filename">No model loaded</span>
     <div class="spacer"></div>
+    <span class="ruleset-badge" id="ruleset-badge">Loading ruleset…</span>
+    <button class="btn" id="btn-dash" disabled>Dashboard</button>
     <button class="btn" id="btn-reset" title="Reset view" disabled>Reset view</button>
-    <button class="btn primary" id="btn-open">Open IFC file</button>
-    <input type="file" id="file-input" accept=".ifc" />
+    <button class="btn primary" id="btn-open">Add IFC file</button>
+    <input type="file" id="file-input" accept=".ifc" multiple />
   </div>
 
-  <!-- Left tool rail -->
+  <!-- Left panel -->
+  <div id="left">
+    <div id="models"></div>
+    <div class="tabs">
+      <button data-tab="query" class="active"><span>QUERIES</span></button>
+      <button data-tab="check"><span>COMPLIANCE</span></button>
+    </div>
+
+    <!-- Query tab -->
+    <div id="tab-query" style="display:flex;flex-direction:column;flex:1;overflow:hidden;">
+      <div class="filters">
+        <select id="f-agency"><option value="">All agencies</option></select>
+        <select id="f-discipline"><option value="">All disciplines</option></select>
+        <input type="search" id="f-search" placeholder="Filter component or property…" />
+        <label><input type="checkbox" id="f-present" checked /> Only components present in model</label>
+      </div>
+      <div class="scroll" id="tree"></div>
+      <div id="legend">
+        <div class="legend-head">
+          <div class="lt" id="legend-title"></div>
+          <button class="btn sm" id="btn-clear-query">Clear</button>
+        </div>
+        <div class="legend-rows" id="legend-rows"></div>
+      </div>
+    </div>
+
+    <!-- Check tab -->
+    <div id="tab-check" style="display:none;flex-direction:column;flex:1;overflow:hidden;">
+      <div class="check-actions">
+        <button class="btn primary" id="btn-run-check" disabled>Run compliance check</button>
+        <button class="btn" id="btn-colour-status" disabled title="Colour the model by check status">Colour</button>
+      </div>
+      <div class="summary" id="summary"></div>
+      <div class="scroll" id="issues"></div>
+    </div>
+  </div>
+
+  <!-- Tool rail -->
   <div id="rail">
+    <div class="rail-btn" id="tool-collapse" title="Collapse panel">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M15 6l-6 6 6 6"/></svg>
+    </div>
+    <div class="rail-btn" id="tool-spaces" title="Show IfcSpace volumes">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3 7l9-4 9 4v10l-9 4-9-4V7z"/><path d="M3 7l9 4 9-4M12 11v10"/></svg>
+    </div>
+    <div class="rail-btn" id="tool-showall" title="Show all hidden elements">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 12s3.5-6.5 10-6.5S22 12 22 12s-3.5 6.5-10 6.5S2 12 2 12z"/><circle cx="12" cy="12" r="2.6"/></svg>
+    </div>
+    <div class="rail-btn" id="tool-ghost" title="Ghost the rest of the model">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="3" y="3" width="18" height="18" rx="1"/><path d="M3 9h18M3 15h18"/></svg>
+    </div>
     <div class="rail-btn" id="tool-wireframe" title="Toggle wireframe">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M12 2l9 5v10l-9 5-9-5V7l9-5z"/><path d="M3 7l9 5 9-5M12 12v10"/></svg>
-    </div>
-    <div class="rail-btn" id="tool-sections" title="Toggle transparency">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="3" y="3" width="18" height="18" rx="1"/><path d="M3 9h18M3 15h18"/></svg>
     </div>
     <div class="rail-btn" id="tool-fit" title="Fit to view">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
     </div>
   </div>
 
-  <!-- Drop zone / empty state -->
+  <!-- Drop zone -->
   <div id="dropzone" class="visible">
     <div id="dropzone-inner">
       <svg class="glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2">
         <path d="M12 2l9 5v10l-9 5-9-5V7l9-5z"/>
         <path d="M3 7l9 5 9-5M12 12v10M7.5 4.5l9 5M16.5 4.5l-9 5"/>
       </svg>
-      <h1>Drop an IFC file to view it</h1>
-      <p>Drag an .ifc file anywhere on this window, or open one from your computer. Nothing is uploaded — the model is parsed locally in your browser.</p>
+      <h1>Drop IFC files to check them</h1>
+      <p>Drag one or more .ifc files anywhere on this window, or choose them from your computer. Load several to check a federated model. Nothing is uploaded — everything is parsed locally in your browser and checked against the CORENET X IFC-SG mapping.</p>
       <button class="btn primary" id="btn-open-empty">Choose file</button>
     </div>
   </div>
@@ -407,310 +545,30 @@
     <div class="panel-body" id="panel-body"></div>
   </div>
 
-  <!-- Stats -->
-  <div id="stats"></div>
+  <!-- Dashboard -->
+  <div id="dash">
+    <div class="dash-head">
+      <div>
+        <h2>Project Dashboard</h2>
+        <div class="sub" id="dash-sub"></div>
+      </div>
+      <div class="spacer"></div>
+      <div class="seg" id="dash-seg">
+        <button data-brk="level" class="active">By level</button>
+        <button data-brk="file">By file</button>
+        <button data-brk="none">Totals only</button>
+      </div>
+      <button class="btn" id="dash-close">Close</button>
+    </div>
+    <div class="dash-body" id="dash-body"></div>
+  </div>
 
-  <!-- Toast -->
+  <!-- Right-click menu -->
+  <div id="ctxmenu"></div>
+
   <div id="toast"></div>
-
 </div>
 
-<script type="module">
-import * as THREE from 'three';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { IFCLoader } from 'web-ifc-three/IFCLoader';
-
-// ---------- Teams SDK (optional context, no-op outside Teams) ----------
-(function initTeams() {
-  const script = document.createElement('script');
-  script.src = 'https://res.cdn.office.net/teams-js/2.19.0/js/MicrosoftTeams.min.js';
-  script.onload = () => {
-    try {
-      window.microsoftTeams.app.initialize().then(() => {
-        window.microsoftTeams.app.notifySuccess();
-      }).catch(() => {});
-    } catch (e) { /* not running inside Teams */ }
-  };
-  document.head.appendChild(script);
-})();
-
-// ---------- Scene setup ----------
-const container = document.getElementById('viewer-container');
-
-const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x1b1e23);
-
-const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 5000);
-camera.position.set(18, 14, 18);
-
-const renderer = new THREE.WebGLRenderer({ antialias: true });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-renderer.setSize(window.innerWidth, window.innerHeight);
-container.appendChild(renderer.domElement);
-
-const controls = new OrbitControls(camera, renderer.domElement);
-controls.enableDamping = true;
-controls.dampingFactor = 0.08;
-controls.target.set(0, 0, 0);
-
-// Lighting: neutral three-point setup so materials read consistently
-const hemi = new THREE.HemisphereLight(0xdfe6ee, 0x1a1c20, 0.9);
-scene.add(hemi);
-const key = new THREE.DirectionalLight(0xffffff, 1.0);
-key.position.set(20, 30, 10);
-scene.add(key);
-const fill = new THREE.DirectionalLight(0xffffff, 0.35);
-fill.position.set(-20, 10, -15);
-scene.add(fill);
-
-const grid = new THREE.GridHelper(60, 60, 0x343a42, 0x2a2e35);
-grid.position.y = 0;
-scene.add(grid);
-
-function resize() {
-  camera.aspect = window.innerWidth / window.innerHeight;
-  camera.updateProjectionMatrix();
-  renderer.setSize(window.innerWidth, window.innerHeight);
-}
-window.addEventListener('resize', resize);
-
-function animate() {
-  requestAnimationFrame(animate);
-  controls.update();
-  renderer.render(scene, camera);
-}
-animate();
-
-// ---------- IFC loader ----------
-const ifcLoader = new IFCLoader();
-ifcLoader.ifcManager.setWasmPath('https://unpkg.com/web-ifc@0.0.36/');
-ifcLoader.ifcManager.applyWebIfcConfig({ COORDINATE_TO_ORIGIN: true, USE_FAST_BOOLS: true });
-
-let currentModel = null;
-let wireframeOn = false;
-let transparentOn = false;
-
-// ---------- UI refs ----------
-const fileInput = document.getElementById('file-input');
-const btnOpen = document.getElementById('btn-open');
-const btnOpenEmpty = document.getElementById('btn-open-empty');
-const btnReset = document.getElementById('btn-reset');
-const filenameEl = document.getElementById('filename');
-const dropzone = document.getElementById('dropzone');
-const loading = document.getElementById('loading');
-const barFill = document.getElementById('bar-fill');
-const loadingLabel = document.getElementById('loading-label');
-const statsEl = document.getElementById('stats');
-const toast = document.getElementById('toast');
-const panel = document.getElementById('panel');
-const panelBody = document.getElementById('panel-body');
-const panelClose = document.getElementById('panel-close');
-const toolWireframe = document.getElementById('tool-wireframe');
-const toolSections = document.getElementById('tool-sections');
-const toolFit = document.getElementById('tool-fit');
-
-btnOpen.addEventListener('click', () => fileInput.click());
-btnOpenEmpty.addEventListener('click', () => fileInput.click());
-fileInput.addEventListener('change', (e) => {
-  if (e.target.files.length) loadFile(e.target.files[0]);
-});
-
-// Drag & drop across the whole window.
-// The big empty-state panel is only shown pre-drop when no model is loaded yet;
-// once a model exists, dropping a new file still works, it just doesn't cover the view.
-['dragenter', 'dragover'].forEach(evt => {
-  window.addEventListener(evt, (e) => {
-    e.preventDefault();
-    if (!currentModel) dropzone.classList.add('visible');
-    dropzone.classList.add('dragover');
-  });
-});
-['dragleave', 'drop'].forEach(evt => {
-  window.addEventListener(evt, (e) => {
-    e.preventDefault();
-    if (evt === 'dragleave' && e.target !== dropzone) return;
-    dropzone.classList.remove('dragover');
-    if (currentModel) dropzone.classList.remove('visible');
-  });
-});
-window.addEventListener('drop', (e) => {
-  e.preventDefault();
-  const file = e.dataTransfer.files[0];
-  if (file) loadFile(file);
-});
-
-panelClose.addEventListener('click', () => panel.classList.remove('visible'));
-
-btnReset.addEventListener('click', () => fitCameraToModel());
-toolFit.addEventListener('click', () => fitCameraToModel());
-
-toolWireframe.addEventListener('click', () => {
-  if (!currentModel) return;
-  wireframeOn = !wireframeOn;
-  toolWireframe.classList.toggle('active', wireframeOn);
-  currentModel.traverse((child) => {
-    if (child.isMesh) {
-      const mats = Array.isArray(child.material) ? child.material : [child.material];
-      mats.forEach((m) => { m.wireframe = wireframeOn; });
-    }
-  });
-});
-
-toolSections.addEventListener('click', () => {
-  if (!currentModel) return;
-  transparentOn = !transparentOn;
-  toolSections.classList.toggle('active', transparentOn);
-  currentModel.traverse((child) => {
-    if (child.isMesh) {
-      const mats = Array.isArray(child.material) ? child.material : [child.material];
-      mats.forEach((m) => {
-        m.transparent = transparentOn;
-        m.opacity = transparentOn ? 0.35 : 1;
-      });
-    }
-  });
-});
-
-function showToast(msg) {
-  toast.textContent = msg;
-  toast.classList.add('visible');
-  setTimeout(() => toast.classList.remove('visible'), 4200);
-}
-
-function setProgress(pct, label) {
-  barFill.style.width = Math.min(pct, 100) + '%';
-  if (label) loadingLabel.textContent = label;
-}
-
-async function loadFile(file) {
-  if (!file.name.toLowerCase().endsWith('.ifc')) {
-    showToast('That file doesn\'t look like an IFC model (.ifc).');
-    return;
-  }
-
-  dropzone.classList.remove('visible');
-  loading.classList.add('visible');
-  setProgress(5, 'Reading file…');
-
-  try {
-    const url = URL.createObjectURL(file);
-
-    ifcLoader.ifcManager.setOnProgress((event) => {
-      const pct = event.total ? (event.loaded / event.total) * 100 : 40;
-      setProgress(pct, 'Parsing geometry…');
-    });
-
-    const model = await ifcLoader.loadAsync(url);
-
-    if (currentModel) {
-      scene.remove(currentModel);
-    }
-
-    scene.add(model);
-    currentModel = model;
-
-    setProgress(100, 'Done');
-    filenameEl.textContent = file.name;
-    filenameEl.classList.add('has-file');
-    btnReset.disabled = false;
-    statsEl.classList.add('visible');
-    statsEl.textContent = file.name.toUpperCase();
-
-    fitCameraToModel();
-    setupPicking(model);
-
-    URL.revokeObjectURL(url);
-  } catch (err) {
-    console.error(err);
-    showToast('Could not load that model. It may be an unsupported IFC schema or a corrupted file.');
-    dropzone.classList.add('visible');
-  } finally {
-    setTimeout(() => loading.classList.remove('visible'), 250);
-  }
-}
-
-function fitCameraToModel() {
-  if (!currentModel) return;
-  const box = new THREE.Box3().setFromObject(currentModel);
-  const size = box.getSize(new THREE.Vector3());
-  const center = box.getCenter(new THREE.Vector3());
-
-  const maxDim = Math.max(size.x, size.y, size.z) || 10;
-  const dist = maxDim * 1.6;
-
-  camera.position.set(center.x + dist, center.y + dist * 0.75, center.z + dist);
-  camera.near = maxDim / 100;
-  camera.far = maxDim * 50;
-  camera.updateProjectionMatrix();
-
-  controls.target.copy(center);
-  controls.update();
-
-  grid.position.y = box.min.y;
-}
-
-// ---------- Element picking ----------
-const raycaster = new THREE.Raycaster();
-const pointer = new THREE.Vector2();
-
-function setupPicking(model) {
-  renderer.domElement.addEventListener('click', onPick);
-}
-
-async function onPick(event) {
-  if (!currentModel) return;
-  const rect = renderer.domElement.getBoundingClientRect();
-  pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-  pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
-
-  raycaster.setFromCamera(pointer, camera);
-  const intersects = raycaster.intersectObject(currentModel, true);
-  if (!intersects.length) {
-    panel.classList.remove('visible');
-    return;
-  }
-
-  const hit = intersects[0];
-  const faceIndex = hit.faceIndex;
-  const modelID = currentModel.modelID;
-
-  try {
-    const expressID = ifcLoader.ifcManager.getExpressId(currentModel.geometry, faceIndex);
-    const props = await ifcLoader.ifcManager.getItemProperties(modelID, expressID, false);
-    renderProps(props, expressID);
-  } catch (err) {
-    console.error(err);
-  }
-}
-
-function renderProps(props, expressID) {
-  const type = props.constructor && props.constructor.name ? props.constructor.name : 'Element';
-  const name = props.Name && props.Name.value ? props.Name.value : '—';
-
-  let html = `<div class="prop-type">${escapeHtml(name)}</div>`;
-  html += `<div class="prop-id">Express ID ${expressID}</div>`;
-
-  const rows = [
-    ['Type', props.constructor?.name ?? '—'],
-    ['GlobalId', props.GlobalId?.value ?? '—'],
-    ['ObjectType', props.ObjectType?.value ?? '—'],
-    ['Description', props.Description?.value ?? '—'],
-    ['Tag', props.Tag?.value ?? '—'],
-  ];
-
-  for (const [k, v] of rows) {
-    html += `<div class="prop-row"><span class="k">${k}</span><span class="v">${escapeHtml(String(v))}</span></div>`;
-  }
-
-  panelBody.innerHTML = html;
-  panel.classList.add('visible');
-}
-
-function escapeHtml(str) {
-  const div = document.createElement('div');
-  div.textContent = str;
-  return div.innerHTML;
-}
-</script>
+<script type="module" src="./js/app.js"></script>
 </body>
 </html>
