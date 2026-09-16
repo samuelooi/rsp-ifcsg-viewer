@@ -62,13 +62,41 @@ export class Viewer {
     this.camera = new THREE.PerspectiveCamera(60, 1, 0.1, 5000);
     this.camera.position.set(18, 14, 18);
 
+    // A second camera for plan views: true orthographic, straight down, so a
+    // "plan" is an accurate flat projection rather than a steep perspective shot.
+    this.orthoCamera = new THREE.OrthographicCamera(-10, 10, 10, -10, 0.1, 5000);
+    this.activeCamera = this.camera;
+    this._orthoHalfHeight = 10;
+
     this.renderer = new THREE.WebGLRenderer({ antialias: true });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.container.appendChild(this.renderer.domElement);
 
+    // Left button pans, right button orbits — right stays free of drag-panning
+    // so it reads naturally alongside its other job, opening the context menu.
+    const mouseButtons = { LEFT: THREE.MOUSE.PAN, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.ROTATE };
+
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.08;
+    this.controls.mouseButtons = { ...mouseButtons };
+
+    // Locked to top-down: no orbit, just pan/zoom, so plan mode can't be tilted
+    // into a perspective view by accident.
+    this.controlsOrtho = new OrbitControls(this.orthoCamera, this.renderer.domElement);
+    this.controlsOrtho.enableDamping = true;
+    this.controlsOrtho.dampingFactor = 0.08;
+    this.controlsOrtho.enableRotate = false;
+    this.controlsOrtho.screenSpacePanning = true;
+    this.controlsOrtho.enabled = false;
+    this.controlsOrtho.mouseButtons = { ...mouseButtons };
+
+    // Section cuts (vertical, user-drawn) and the plan level cut (horizontal),
+    // combined into one clipping-plane list on the renderer.
+    this.sectionPlanes = [];   // [{ id, plane, normal, a, b, mid, group }]
+    this._sectionSeq = 0;
+    this.planClipPlane = null; // THREE.Plane | null
+    this.groundY = 0;
 
     this.scene.add(new THREE.HemisphereLight(0xdfe6ee, 0x1a1c20, 0.9));
     const key = new THREE.DirectionalLight(0xffffff, 1.0);
@@ -119,11 +147,22 @@ export class Viewer {
     this.raycaster = new THREE.Raycaster();
     this.pointer = new THREE.Vector2();
 
+    // Both mouse buttons now drive a camera drag (left pans, right orbits), so
+    // a click/contextmenu firing on release of a drag would otherwise pick an
+    // element or pop the menu at wherever the drag happened to end. Track each
+    // button's mousedown point and ignore the follow-up if it moved.
+    this._downPos = {};
+    this.renderer.domElement.addEventListener('pointerdown', (e) => {
+      this._downPos[e.button] = { x: e.clientX, y: e.clientY };
+    });
+
     this.renderer.domElement.addEventListener('click', (e) => {
+      if (this._wasDrag(0, e)) return;
       this.pickListeners.forEach((cb) => cb(this._pickAt(e)));
     });
     this.renderer.domElement.addEventListener('contextmenu', (e) => {
       e.preventDefault();
+      if (this._wasDrag(2, e)) return;
       const hit = this._pickAt(e);
       this.menuListeners.forEach((cb) => cb(hit, e.clientX, e.clientY));
     });
@@ -138,13 +177,27 @@ export class Viewer {
     const h = this.container.clientHeight || window.innerHeight;
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
+    this._applyOrthoFrustum();
     this.renderer.setSize(w, h);
+  }
+
+  _applyOrthoFrustum() {
+    const w = this.container.clientWidth || window.innerWidth;
+    const h = this.container.clientHeight || window.innerHeight;
+    const aspect = w / h;
+    const halfH = this._orthoHalfHeight || 10;
+    this.orthoCamera.left = -halfH * aspect;
+    this.orthoCamera.right = halfH * aspect;
+    this.orthoCamera.top = halfH;
+    this.orthoCamera.bottom = -halfH;
+    this.orthoCamera.updateProjectionMatrix();
   }
 
   _animate() {
     requestAnimationFrame(() => this._animate());
     this.controls.update();
-    this.renderer.render(this.scene, this.camera);
+    this.controlsOrtho.update();
+    this.renderer.render(this.scene, this.activeCamera);
   }
 
   // ------------------------------------------------------------ model loading
@@ -515,7 +568,8 @@ export class Viewer {
 
   // ------------------------------------------------------------------ camera
 
-  fit() {
+  /** Union box of everything currently visible, or null if nothing is. */
+  _visibleBox() {
     const box = new THREE.Box3();
     let any = false;
     for (const entry of this.models.values()) {
@@ -523,7 +577,17 @@ export class Viewer {
       box.union(new THREE.Box3().setFromObject(entry.mesh));
       any = true;
     }
-    if (!any || box.isEmpty()) return;
+    return any && !box.isEmpty() ? box : null;
+  }
+
+  fit() {
+    if (this.activeCamera === this.orthoCamera) {
+      this.enterPlanView();
+      return;
+    }
+
+    const box = this._visibleBox();
+    if (!box) return;
 
     const size = box.getSize(new THREE.Vector3());
     const center = box.getCenter(new THREE.Vector3());
@@ -537,12 +601,224 @@ export class Viewer {
     this.controls.target.copy(center);
     this.controls.update();
     this.grid.position.y = box.min.y;
+    this.groundY = box.min.y;
+  }
+
+  /** Enable/disable whichever OrbitControls belongs to the active camera. */
+  setOrbitEnabled(on) {
+    this.controls.enabled = on && this.activeCamera === this.camera;
+    this.controlsOrtho.enabled = on && this.activeCamera === this.orthoCamera;
+  }
+
+  // -------------------------------------------------------------- plan views
+
+  /** Switches to a straight-down orthographic camera framed on the model. */
+  enterPlanView() {
+    const box = this._visibleBox();
+    if (!box) return false;
+
+    const size = box.getSize(new THREE.Vector3());
+    const center = box.getCenter(new THREE.Vector3());
+    const halfH = (Math.max(size.x, size.z) / 2) * 1.08 || 10;
+    this._orthoHalfHeight = halfH;
+    this._applyOrthoFrustum();
+
+    const above = Math.max(size.y, 10) + 20;
+    this.orthoCamera.position.set(center.x, box.max.y + above, center.z);
+    this.orthoCamera.up.set(0, 0, -1);
+    this.orthoCamera.lookAt(center.x, box.min.y, center.z);
+    this.orthoCamera.near = 0.1;
+    this.orthoCamera.far = size.y + above + 100;
+    this.orthoCamera.updateProjectionMatrix();
+
+    this.controlsOrtho.target.set(center.x, box.min.y, center.z);
+    this.controlsOrtho.update();
+
+    this.activeCamera = this.orthoCamera;
+    this.controls.enabled = false;
+    this.controlsOrtho.enabled = true;
+    this.groundY = box.min.y;
+    return true;
+  }
+
+  exitPlanView() {
+    this.activeCamera = this.camera;
+    this.controlsOrtho.enabled = false;
+    this.controls.enabled = true;
+  }
+
+  /** Horizontal clip plane: keeps geometry at or below `y`, hides above. */
+  setPlanClip(y) {
+    this.planClipPlane = new THREE.Plane(new THREE.Vector3(0, -1, 0), y);
+    this._updateClipping();
+  }
+
+  clearPlanClip() {
+    this.planClipPlane = null;
+    this._updateClipping();
+  }
+
+  /**
+   * The world-Y bounding box of one element, read straight from the rendered
+   * mesh (position buffer + the pristine index cache), so it needs neither the
+   * wasm model (already released by the time this is useful) nor any placement
+   * math of our own — whatever the mesh actually shows is the ground truth.
+   */
+  elementYRange(modelID, expressID) {
+    const entry = this.models.get(modelID);
+    if (!entry) return null;
+    const items = this._itemsMap(modelID);
+    if (!items) return null;
+    const byMaterial = items.map.get(expressID);
+    if (!byMaterial) return null;
+
+    const pos = entry.mesh.geometry.attributes.position;
+    const idx = items.indexCache;
+    let min = Infinity, max = -Infinity;
+    for (const ranges of Object.values(byMaterial)) {
+      for (let p = 0; p < ranges.length; p += 2) {
+        for (let j = ranges[p]; j <= ranges[p + 1]; j++) {
+          const y = pos.getY(idx[j]);
+          if (y < min) min = y;
+          if (y > max) max = y;
+        }
+      }
+    }
+    return isFinite(min) ? { min, max } : null;
+  }
+
+  /**
+   * Median base height of a set of elements, e.g. everything on one storey —
+   * used as that storey's floor reference for a plan cut. Sampling (rather than
+   * every element) keeps this cheap on a storey with thousands of elements, and
+   * the median shrugs off the odd multi-storey column or shaft.
+   */
+  sampleFloorY(elements, max = 60) {
+    if (!elements || !elements.length) return null;
+    const step = Math.max(1, Math.floor(elements.length / max));
+    const mins = [];
+    for (let i = 0; i < elements.length; i += step) {
+      const r = this.elementYRange(elements[i].modelID, elements[i].expressID);
+      if (r) mins.push(r.min);
+    }
+    if (!mins.length) return null;
+    mins.sort((a, b) => a - b);
+    return mins[Math.floor(mins.length / 2)];
+  }
+
+  // ------------------------------------------------------------ section cuts
+
+  /**
+   * Adds a vertical cutting plane through two ground points, keeping the half
+   * that contains `cameraPos` (flip it afterwards with `flipSectionPlane`).
+   */
+  addSectionPlane(a, b, cameraPos) {
+    const dir = new THREE.Vector3().subVectors(b, a);
+    dir.y = 0;
+    if (dir.lengthSq() < 1e-6) return null;
+    dir.normalize();
+
+    const normal = new THREE.Vector3(-dir.z, 0, dir.x);
+    const mid = new THREE.Vector3().addVectors(a, b).multiplyScalar(0.5);
+    const toCam = new THREE.Vector3().subVectors(cameraPos, mid);
+    if (normal.dot(toCam) < 0) normal.negate();
+
+    const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(normal, mid);
+    const id = ++this._sectionSeq;
+    const entry = { id, plane, normal, a: a.clone(), b: b.clone(), mid, group: null };
+    entry.group = this._buildSectionHelper(entry);
+    this.scene.add(entry.group);
+    this.sectionPlanes.push(entry);
+    this._updateClipping();
+    return id;
+  }
+
+  flipSectionPlane(id) {
+    const s = this.sectionPlanes.find((x) => x.id === id);
+    if (!s) return;
+    s.normal.negate();
+    s.plane.setFromNormalAndCoplanarPoint(s.normal, s.mid);
+    this.scene.remove(s.group);
+    s.group = this._buildSectionHelper(s);
+    this.scene.add(s.group);
+    this._updateClipping();
+  }
+
+  removeSectionPlane(id) {
+    const i = this.sectionPlanes.findIndex((x) => x.id === id);
+    if (i < 0) return;
+    this.scene.remove(this.sectionPlanes[i].group);
+    this.sectionPlanes.splice(i, 1);
+    this._updateClipping();
+  }
+
+  clearSectionPlanes() {
+    for (const s of this.sectionPlanes) this.scene.remove(s.group);
+    this.sectionPlanes = [];
+    this._updateClipping();
+  }
+
+  _updateClipping() {
+    const planes = this.sectionPlanes.map((s) => s.plane);
+    if (this.planClipPlane) planes.push(this.planClipPlane);
+    this.renderer.clippingPlanes = planes;
+  }
+
+  /** The cut line on the ground plus an arrow pointing into the kept half. */
+  _buildSectionHelper({ a, b, mid, normal }) {
+    const group = new THREE.Group();
+    const y = this.groundY;
+    const pa = new THREE.Vector3(a.x, y, a.z);
+    const pb = new THREE.Vector3(b.x, y, b.z);
+
+    const geo = new THREE.BufferGeometry().setFromPoints([pa, pb]);
+    const line = new THREE.Line(geo, new THREE.LineBasicMaterial({ color: 0xffcf5c, depthTest: false }));
+    line.renderOrder = 999;
+    group.add(line);
+
+    const len = pa.distanceTo(pb) || 1;
+    const arrow = new THREE.ArrowHelper(
+      normal.clone(), new THREE.Vector3(mid.x, y, mid.z),
+      Math.max(len * 0.18, 0.6), 0xffcf5c, Math.max(len * 0.06, 0.25), Math.max(len * 0.04, 0.18));
+    arrow.line.material.depthTest = false;
+    arrow.cone.material.depthTest = false;
+    arrow.renderOrder = 999;
+    group.add(arrow);
+
+    return group;
+  }
+
+  /** Ray-casts the pointer against loaded geometry, falling back to the ground plane. */
+  raycastGround(event) {
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    const ndc = new THREE.Vector2(
+      ((event.clientX - rect.left) / rect.width) * 2 - 1,
+      -((event.clientY - rect.top) / rect.height) * 2 + 1);
+    const ray = new THREE.Raycaster();
+    ray.setFromCamera(ndc, this.activeCamera);
+
+    const targets = [];
+    for (const entry of this.models.values()) if (entry.visible) targets.push(entry.mesh);
+    const hits = ray.intersectObjects(targets, true).filter((h) => h.object.visible);
+    if (hits.length) return hits[0].point.clone();
+
+    const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -this.groundY);
+    const pt = new THREE.Vector3();
+    return ray.ray.intersectPlane(plane, pt) ? pt : null;
   }
 
   // ----------------------------------------------------------------- picking
 
   onPick(cb) { this.pickListeners.push(cb); }
   onContextMenu(cb) { this.menuListeners.push(cb); }
+
+  /** True if `button` moved more than a few px between its mousedown and `e`. */
+  _wasDrag(button, e) {
+    const start = this._downPos[button];
+    if (!start) return false;
+    const dx = e.clientX - start.x, dy = e.clientY - start.y;
+    return dx * dx + dy * dy > 25;
+  }
 
   /** @returns {{modelID:number, expressID:number}|null} */
   _pickAt(event) {
@@ -551,7 +827,7 @@ export class Viewer {
     const rect = this.renderer.domElement.getBoundingClientRect();
     this.pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
     this.pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
-    this.raycaster.setFromCamera(this.pointer, this.camera);
+    this.raycaster.setFromCamera(this.pointer, this.activeCamera);
 
     // Overlay subsets live on the scene, not under a model, so both have to be
     // offered to the raycaster or picking would stop working during a query.
@@ -562,7 +838,16 @@ export class Viewer {
     const hits = this.raycaster.intersectObjects(targets, true).filter((h) => h.object.visible);
     if (!hits.length) return null;
 
-    const hit = hits[0];
+    // The raycaster sees the full, unclipped geometry, so the nearest hit can be
+    // something a section or plan cut is actually hiding (e.g. the roof, from
+    // above a plan cut) — skip past anything on the discarded side of any
+    // active clipping plane to the first hit the renderer would actually draw.
+    const planes = this.renderer.clippingPlanes;
+    const hit = planes && planes.length
+      ? hits.find((h) => planes.every((p) => p.distanceToPoint(h.point) >= 0))
+      : hits[0];
+    if (!hit) return null;
+
     try {
       const expressID = this.loader.ifcManager.getExpressId(hit.object.geometry, hit.faceIndex);
       if (expressID === undefined || expressID === null) return null;
