@@ -1,0 +1,98 @@
+{
+  "_readme": "Which CORENET X submission gateway each component belongs to. This is NOT part of the authority-issued mapping workbook (build-ifcsg-rules.ps1 has no such column) -- it is maintained by hand, separately, so classifying components doesn't require touching or regenerating the workbook. Structure follows the Excel: agency is the top-level key (matching the UI's Gateway -> Authority -> Component hierarchy), component is the leaf, sourced verbatim from data/ifcsg-rules.json so it always matches the real agency+component pairs in the mapping. Resolution order in js/ifcsg.js: byAgencyComponent[agency][component] -> byAgency[agency] -> default. Every component below is set to 'construction' as a starting point -- edit individual entries to 'design' as the real Design Gateway / Construction Gateway split is determined. Valid values: 'design', 'construction', 'unclassified'.",
+  "default": "construction",
+  "byAgencyComponent": {
+    "ALL": {
+      "Block Name": "construction",
+      "Space (Usage)": "construction"
+    },
+    "BCA": {
+      "Accessible Route": "construction",
+      "Door": "construction",
+      "Escalator": "construction",
+      "Family-Friendly Furniture": "construction",
+      "Finishes": "construction",
+      "Footpath": "construction",
+      "Household Shelter": "construction",
+      "Lift": "construction",
+      "Parking Lot": "construction",
+      "Parking Lot (relevant elements)": "construction",
+      "Prefabricated Building Systems and MEP Components": "construction",
+      "Project Development Type": "construction",
+      "Railing": "construction",
+      "Ramp": "construction",
+      "Refuse Chute / Recyclables Chute": "construction",
+      "Roof": "construction",
+      "Sanitary Appliances (Urinal)": "construction",
+      "Sanitary Appliances (Water Closet)": "construction",
+      "Shading Device": "construction",
+      "Staircase": "construction",
+      "Wall": "construction",
+      "Window": "construction"
+    },
+    "LTA": {
+      "Lamp Post": "construction",
+      "Lift": "construction",
+      "Parking Lot": "construction",
+      "Parking Lot (relevant elements)": "construction",
+      "Ramp": "construction",
+      "Road": "construction"
+    },
+    "NEA": {
+      "Distribution Chamber": "construction",
+      "Door": "construction",
+      "Pollution Control": "construction",
+      "Refuse Chute / Recyclables Chute": "construction",
+      "Road": "construction",
+      "Sanitary Appliances (Urinal)": "construction",
+      "Sanitary Appliances (Wash Basin)": "construction",
+      "Sanitary Appliances (Water Closet)": "construction"
+    },
+    "NPARKS": {
+      "Green Verge": "design",
+      "Landscape Plants": "design",
+      "Parking Lot": "design",
+      "Planter Box/ Planting Trough": "design",
+      "Planting Areas": "design",
+      "Roof": "construction",
+      "Site Boundary": "construction",
+      "Wall": "construction"
+    },
+    "PUB": {
+      "Grating": "construction",
+      "Tank (RC Tank)": "design"
+    },
+    "SCDF": {
+      "Ceiling": "construction",
+      "Door": "construction",
+      "Finishes": "construction",
+      "Fire Access Opening": "construction",
+      "Fire Alarm": "construction",
+      "Fire Extinguisher": "construction",
+      "Lift": "construction",
+      "Road": "construction",
+      "Seating": "construction",
+      "Signage": "construction",
+      "Soffit": "construction",
+      "Staircase": "construction",
+      "Window": "construction"
+    },
+    "URA": {
+      "Building Storey": "construction",
+      "Curtain Wall": "construction",
+      "Earthworks": "construction",
+      "Envelope Control": "construction",
+      "Parking Lot (relevant elements)": "construction",
+      "Planter Box/ Planting Trough": "construction",
+      "Racking System": "construction",
+      "Roof": "construction",
+      "Site": "construction",
+      "Site Boundary": "construction",
+      "Site Coverage": "construction",
+      "Space (Area)": "construction",
+      "Wall": "construction",
+      "Window": "construction"
+    }
+  },
+  "byAgency": {}
+}

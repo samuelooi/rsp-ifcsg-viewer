@@ -14,8 +14,9 @@ import { buildIndex, mergeIndexes } from './ifc-index.js';
 import { DASHBOARD_ENTITIES, computeDashboard, formatValue as fmtNum } from './dashboard.js';
 import { measure, project, formatBytes, LEVEL } from './memory.js';
 import {
-  loadRuleset, selectElements, groupByValue,
-  describeSubtypes, formatValue, isEmptyValue,
+  loadRuleset, selectElements, groupByValue, runCheck, evaluate,
+  describeSubtypes, matchesTarget, formatValue, isEmptyValue,
+  STATUS, STATUS_LABEL, GATEWAY_ORDER, GATEWAY_LABEL,
 } from './ifcsg.js';
 import { buildTransform } from './geo/georef.js';
 import * as registry from './checks/registry.js';
@@ -65,6 +66,15 @@ let checkRunning = false;
 /** Aborts an in-flight run when the model changes or a new run starts. */
 let checkAbort = null;
 
+let sectionArmed = false;  // click-drag on the canvas draws a new section plane
+let sectionDragStart = null;
+let planActive = null;     // { name, y } while a plan view is showing
+
+// Query-tree hierarchy filters, macro to micro: Gateway narrows Authority
+// narrows Component. '' means "all" at that tier.
+let gatewayFilter = '';
+let agencyFilter = '';
+
 // Visibility policy. The viewer holds the resulting set; these two own the intent.
 const manualHidden = new Set();   // element keys hidden via the context menu
 let spacesVisible = false;        // IfcSpace volumes obscure everything by default
@@ -78,7 +88,8 @@ const el = {
   fileInput: $('file-input'), dropzone: $('dropzone'),
   loading: $('loading'), barFill: $('bar-fill'), loadingLabel: $('loading-label'),
   toast: $('toast'), left: $('left'), models: $('models'),
-  fAgency: $('f-agency'), fDiscipline: $('f-discipline'), fSearch: $('f-search'), fPresent: $('f-present'),
+  gwBubbles: $('gw-bubbles'), agencyBubbles: $('agency-bubbles'),
+  fDiscipline: $('f-discipline'), fSearch: $('f-search'), fPresent: $('f-present'),
   tree: $('tree'), legend: $('legend'), legendTitle: $('legend-title'), legendRows: $('legend-rows'),
   btnClearQuery: $('btn-clear-query'),
   checkMenu: $('check-menu'),
@@ -87,6 +98,8 @@ const el = {
   panel: $('panel'), panelBody: $('panel-body'), panelClose: $('panel-close'),
   toolCollapse: $('tool-collapse'), toolGhost: $('tool-ghost'), toolSpaces: $('tool-spaces'),
   toolShowAll: $('tool-showall'), toolWireframe: $('tool-wireframe'), toolFit: $('tool-fit'),
+  toolSection: $('tool-section'), toolLevels: $('tool-levels'),
+  sectionsBar: $('sections-bar'), levelsPanel: $('levels-panel'), planBadge: $('plan-badge'),
   toolSurvey: $('tool-survey'),
   ctxmenu: $('ctxmenu'),
   btnDash: $('btn-dash'), dash: $('dash'), dashBody: $('dash-body'),
@@ -185,7 +198,7 @@ async function init() {
     el.badge.title =
       `${ruleset.meta.source}\nSheet: ${ruleset.meta.sheet}\nGenerated ${ruleset.meta.generated}`;
     populateFilters();
-    renderTree();
+    refreshFilters();
   } catch (err) {
     console.error(err);
     el.badge.textContent = 'Ruleset failed to load';
@@ -199,9 +212,6 @@ async function init() {
 }
 
 function populateFilters() {
-  for (const a of ruleset.agencies) {
-    el.fAgency.insertAdjacentHTML('beforeend', `<option value="${esc(a)}">${esc(a)}</option>`);
-  }
   for (const d of ruleset.disciplines) {
     el.fDiscipline.insertAdjacentHTML('beforeend', `<option value="${esc(d)}">${esc(d)}</option>`);
   }
@@ -255,6 +265,9 @@ function wireUI() {
   el.toolSpaces.addEventListener('click', () => setSpacesVisible(!spacesVisible));
   el.toolShowAll.addEventListener('click', showAll);
 
+  wireSectionTool();
+  wireLevelsTool();
+
   // The survey outlines are drawn by a check; the rail only clears them, so it
   // does nothing until there is something to clear.
   el.toolSurvey.addEventListener('click', () => {
@@ -274,13 +287,13 @@ function wireUI() {
     viewer.setWireframe(wireframe);
   });
 
-  for (const f of [el.fAgency, el.fDiscipline, el.fPresent]) {
-    f.addEventListener('change', renderTree);
+  for (const f of [el.fDiscipline, el.fPresent]) {
+    f.addEventListener('change', refreshFilters);
   }
   let searchTimer;
   el.fSearch.addEventListener('input', () => {
     clearTimeout(searchTimer);
-    searchTimer = setTimeout(renderTree, 140);
+    searchTimer = setTimeout(refreshFilters, 140);
   });
 
   el.btnClearQuery.addEventListener('click', clearQuery);
@@ -311,7 +324,188 @@ function wireUI() {
 
   // Any left-click or Escape dismisses the context menu.
   document.addEventListener('click', closeContextMenu);
-  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeContextMenu(); });
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    closeContextMenu();
+    closeLevelsPanel();
+    if (sectionArmed) setSectionArmed(false);
+  });
+}
+
+// ------------------------------------------------------------- section cuts
+
+function setSectionArmed(on) {
+  sectionArmed = on;
+  el.toolSection.classList.toggle('active', on);
+  el.toolSection.title = on
+    ? 'Drawing section cuts — click-drag across the model, click the tool again to stop'
+    : 'Section cut: click-drag a line across the model (like Forma)';
+  viewer.renderer.domElement.style.cursor = on ? 'crosshair' : '';
+}
+
+function wireSectionTool() {
+  el.toolSection.addEventListener('click', () => setSectionArmed(!sectionArmed));
+
+  const canvas = viewer.renderer.domElement;
+  canvas.addEventListener('pointerdown', (e) => {
+    if (!sectionArmed || e.button !== 0) return;
+    const p = viewer.raycastGround(e);
+    if (!p) return;
+    sectionDragStart = p;
+    viewer.setOrbitEnabled(false);
+    e.preventDefault();
+  });
+  window.addEventListener('pointerup', (e) => {
+    if (!sectionDragStart) return;
+    const a = sectionDragStart;
+    sectionDragStart = null;
+    viewer.setOrbitEnabled(true);
+    const b = viewer.raycastGround(e);
+    if (!b || a.distanceTo(b) < 0.3) return; // too short to be an intentional cut
+    const id = viewer.addSectionPlane(a, b, viewer.activeCamera.position);
+    if (id != null) renderSectionsBar();
+  });
+}
+
+function renderSectionsBar() {
+  const list = viewer.sectionPlanes;
+  if (!list.length) {
+    el.sectionsBar.classList.remove('visible');
+    el.sectionsBar.innerHTML = '';
+    return;
+  }
+  el.sectionsBar.classList.add('visible');
+  el.sectionsBar.innerHTML = `
+    <div class="sb-head"><span>SECTION CUTS</span><span class="spacer"></span>
+      <button data-act="clear">Clear all</button></div>
+    ${list.map((s, i) => `
+      <div class="sb-row" data-id="${s.id}">
+        <span class="lbl">Section ${i + 1}</span>
+        <button data-act="flip" title="Flip cut side">&#8644;</button>
+        <button data-act="remove" title="Remove">&times;</button>
+      </div>`).join('')}`;
+
+  el.sectionsBar.querySelector('[data-act="clear"]').addEventListener('click', () => {
+    viewer.clearSectionPlanes();
+    renderSectionsBar();
+  });
+  el.sectionsBar.querySelectorAll('.sb-row').forEach((row) => {
+    const id = +row.dataset.id;
+    row.querySelector('[data-act="flip"]').addEventListener('click', () => viewer.flipSectionPlane(id));
+    row.querySelector('[data-act="remove"]').addEventListener('click', () => {
+      viewer.removeSectionPlane(id);
+      renderSectionsBar();
+    });
+  });
+}
+
+// -------------------------------------------------------------- plan / levels
+
+/** Elements grouped by their storey name, from the currently merged index. */
+function storeyGroups() {
+  if (!index) return [];
+  const map = new Map();
+  for (const e of index.all) {
+    if (!e.storey) continue;
+    if (!map.has(e.storey)) map.set(e.storey, []);
+    map.get(e.storey).push(e);
+  }
+  return [...map.entries()].map(([name, elements]) => ({ name, elements }));
+}
+
+/** Storeys with a sampled floor height, ordered top of the building first. */
+function computeLevels() {
+  return storeyGroups()
+    .map((g) => ({ name: g.name, elements: g.elements, y: viewer.sampleFloorY(g.elements) }))
+    .filter((g) => g.y !== null)
+    .sort((a, b) => b.y - a.y);
+}
+
+function wireLevelsTool() {
+  el.toolLevels.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (el.levelsPanel.classList.contains('visible')) closeLevelsPanel();
+    else openLevelsPanel();
+  });
+  document.addEventListener('click', closeLevelsPanel);
+}
+
+function openLevelsPanel() {
+  if (!index) {
+    toast('Load an IFC model first.');
+    return;
+  }
+  const levels = computeLevels();
+  if (!levels.length) {
+    toast('No building storeys with locatable elements were found.');
+    return;
+  }
+
+  el.levelsPanel.innerHTML = `
+    <div class="lvl-head">PLAN VIEW BY LEVEL</div>
+    ${planActive ? `<button data-act="exit"><span class="lname">Exit plan view<small>Return to 3D</small></span></button><div class="sep"></div>` : ''}
+    ${levels.map((l) => `
+      <button data-name="${esc(l.name)}" class="${planActive && planActive.name === l.name ? 'active' : ''}">
+        <span class="lname">${esc(l.name)}<small>${l.elements.length} elements · cut at level +1.2 m</small></span>
+      </button>`).join('')}`;
+
+  const r = el.toolLevels.getBoundingClientRect();
+  el.levelsPanel.style.left = Math.min(r.right + 6, window.innerWidth - 226) + 'px';
+  el.levelsPanel.style.top = Math.max(Math.min(r.top, window.innerHeight - 340), 8) + 'px';
+  el.levelsPanel.classList.add('visible');
+
+  el.levelsPanel.querySelectorAll('button[data-name]').forEach((b) => {
+    b.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      const l = levels.find((x) => x.name === b.dataset.name);
+      enterPlan(l);
+      closeLevelsPanel();
+    });
+  });
+  const exitBtn = el.levelsPanel.querySelector('[data-act="exit"]');
+  if (exitBtn) {
+    exitBtn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      exitPlan();
+      closeLevelsPanel();
+    });
+  }
+}
+
+function closeLevelsPanel() {
+  el.levelsPanel.classList.remove('visible');
+}
+
+function enterPlan(level) {
+  if (!level || !viewer.enterPlanView()) {
+    toast('Nothing visible to frame in plan view.');
+    return;
+  }
+  const y = level.y + 1.2;
+  viewer.setPlanClip(y);
+  planActive = { name: level.name, y };
+  el.toolLevels.classList.add('active');
+  renderPlanBadge();
+}
+
+function exitPlan() {
+  if (!planActive) return;
+  viewer.exitPlanView();
+  viewer.clearPlanClip();
+  planActive = null;
+  el.toolLevels.classList.remove('active');
+  renderPlanBadge();
+}
+
+function renderPlanBadge() {
+  if (!planActive) {
+    el.planBadge.style.display = 'none';
+    el.planBadge.innerHTML = '';
+    return;
+  }
+  el.planBadge.style.display = 'flex';
+  el.planBadge.innerHTML = `Plan · ${esc(planActive.name)}<button title="Exit plan view">&times;</button>`;
+  el.planBadge.querySelector('button').addEventListener('click', exitPlan);
 }
 
 // ------------------------------------------------------------------ model load
@@ -384,6 +578,10 @@ async function loadFiles(files) {
 
 /** Recomputes the merged index, target counts and all dependent UI. */
 function rebuildIndex() {
+  // The set of storeys and their geometry can change entirely with the model
+  // set, so a stale plan cut would show the wrong thing rather than nothing.
+  if (planActive) exitPlan();
+
   index = indexes.size ? mergeIndexes([...indexes.values()]) : null;
 
   counts.clear();
@@ -570,22 +768,85 @@ function closeContextMenu() {
 
 // ------------------------------------------------------------------ query tree
 
-function visibleTargets() {
-  const agency = el.fAgency.value;
+/** Discipline + search + "present in model" — the filters orthogonal to the hierarchy. */
+function matchesSecondaryFilters(t) {
   const discipline = el.fDiscipline.value;
   const q = el.fSearch.value.trim().toLowerCase();
   const onlyPresent = el.fPresent.checked && index;
 
-  return ruleset.targets.filter((t) => {
-    if (agency && t.agency !== agency) return false;
-    if (discipline && t.discipline !== discipline) return false;
-    if (onlyPresent && !(counts.get(t.id) > 0)) return false;
-    if (q) {
-      const hay = [t.component, t.entity, describeSubtypes(t.subtypes),
-        ...t.requirements.map((r) => r.prop + ' ' + r.pset)].join(' ').toLowerCase();
-      if (!hay.includes(q)) return false;
+  if (discipline && t.discipline !== discipline) return false;
+  if (onlyPresent && !(counts.get(t.id) > 0)) return false;
+  if (q) {
+    const hay = [t.component, t.entity, describeSubtypes(t.subtypes),
+      ...t.requirements.map((r) => r.prop + ' ' + r.pset)].join(' ').toLowerCase();
+    if (!hay.includes(q)) return false;
+  }
+  return true;
+}
+
+function visibleTargets() {
+  return ruleset.targets.filter((t) =>
+    (!gatewayFilter || t.gateway === gatewayFilter) &&
+    (!agencyFilter || t.agency === agencyFilter) &&
+    matchesSecondaryFilters(t));
+}
+
+/** Re-renders every filter-driven part of the query tab: bubbles, then the tree. */
+function refreshFilters() {
+  renderGatewayBubbles();
+  renderAgencyBubbles();
+  renderTree();
+}
+
+/** One row of pill filters: `items` is [{id, label, n}], id '' is the "all" bubble. */
+function renderBubbles(container, items, activeId, onClick) {
+  container.innerHTML = items.map((it) => `
+    <button class="bubble${it.id === activeId ? ' active' : ''}${it.id && !it.n ? ' zero' : ''}"
+            data-id="${esc(it.id)}">${esc(it.label)}<span class="bc">${it.n}</span></button>`).join('');
+  container.querySelectorAll('.bubble').forEach((b) => {
+    b.addEventListener('click', () => onClick(b.dataset.id));
+  });
+}
+
+/** Gateway is the top tier: scoped only by the secondary filters, not by authority. */
+function renderGatewayBubbles() {
+  if (!el.gwBubbles) return;
+  const base = ruleset.targets.filter(matchesSecondaryFilters);
+  const counts_ = new Map();
+  for (const t of base) counts_.set(t.gateway, (counts_.get(t.gateway) || 0) + 1);
+
+  const items = [
+    { id: '', label: 'All', n: base.length },
+    ...GATEWAY_ORDER.map((g) => ({ id: g, label: GATEWAY_LABEL[g], n: counts_.get(g) || 0 })),
+  ];
+  renderBubbles(el.gwBubbles, items, gatewayFilter, (id) => {
+    gatewayFilter = id;
+    // A drill-down: if the authority chosen below no longer has anything under
+    // this gateway, drop back to "all authorities" rather than showing nothing.
+    if (agencyFilter && !ruleset.targets.some((t) =>
+      t.agency === agencyFilter && (!gatewayFilter || t.gateway === gatewayFilter) && matchesSecondaryFilters(t))) {
+      agencyFilter = '';
     }
-    return true;
+    refreshFilters();
+  });
+}
+
+/** Authority is the second tier: scoped by whichever gateway is currently selected. */
+function renderAgencyBubbles() {
+  if (!el.agencyBubbles) return;
+  const base = ruleset.targets.filter((t) =>
+    (!gatewayFilter || t.gateway === gatewayFilter) && matchesSecondaryFilters(t));
+  const counts_ = new Map();
+  for (const t of base) counts_.set(t.agency, (counts_.get(t.agency) || 0) + 1);
+
+  const items = [
+    { id: '', label: 'All', n: base.length },
+    ...ruleset.agencies.map((a) => ({ id: a, label: a, n: counts_.get(a) || 0 })),
+  ];
+  renderBubbles(el.agencyBubbles, items, agencyFilter, (id) => {
+    agencyFilter = id;
+    renderAgencyBubbles();
+    renderTree();
   });
 }
 
@@ -594,16 +855,24 @@ function renderTree() {
   const targets = visibleTargets();
 
   if (!targets.length) {
-    el.tree.innerHTML = `<div class="empty-note">${
-      index ? 'No mapped components match these filters.'
-            : 'Load an IFC model, or untick “Only components present in model”.'
-    }</div>`;
+    const msg = (gatewayFilter || agencyFilter)
+      ? 'No mapped components fall under this gateway/authority selection yet — try “All”.'
+      : index ? 'No mapped components match these filters.'
+              : 'Load an IFC model, or untick “Only components present in model”.';
+    el.tree.innerHTML = `<div class="empty-note">${msg}</div>`;
     return;
   }
 
   const parts = [];
+  let gateway = null;
   let agency = null;
   for (const t of targets) {
+    if (t.gateway !== gateway) {
+      gateway = t.gateway;
+      agency = null; // force the authority header to re-print under the new gateway
+      const n = targets.filter((x) => x.gateway === gateway).length;
+      parts.push(`<div class="grp-head-gw">${esc(GATEWAY_LABEL[gateway])}<span class="gw-count">${n}</span></div>`);
+    }
     if (t.agency !== agency) {
       agency = t.agency;
       parts.push(`<div class="grp-head">${esc(agency)}</div>`);
@@ -995,68 +1264,36 @@ function updateRunButton() {
 async function doRunCheck() {
   if (!index || !ruleset || !selectedChecks.size || checkRunning) return;
 
-  const agency = el.fAgency.value;
   const discipline = el.fDiscipline.value;
-  const ids = registry.all().map((c) => c.id).filter((id) => selectedChecks.has(id));
 
-  if (checkAbort) checkAbort.abort();
-  checkAbort = new AbortController();
+  el.btnRunCheck.disabled = true;
+  el.btnRunCheck.textContent = 'Checking…';
 
-  checkRunning = true;
-  updateRunButton();
-  el.issues.innerHTML = '<div class="empty-note">Running…</div>';
-
-  const ctx = {
-    index,
-    ruleset,
-    modelNames: new Map(viewer.entries.map((e) => [e.modelID, e.name])),
-    filter: (t) => (!agency || t.agency === agency) && (!discipline || t.discipline === discipline),
-    signal: checkAbort.signal,
-    progress: () => {},
-    inputsFor,
-    // The submitted files themselves, for the checks that are about the
-    // submission rather than about the building.
-    files: viewer.entries.map((e) => ({ modelID: e.modelID, name: e.name, bytes: e.bytes })),
-    // Where the model sits, and what it is made of — needed by checks that ask
-    // about position rather than properties.
-    coordinationMatrix: viewer.coordinationMatrix,
-    geometry: {
-      // Hulls rather than raw points: the affine transform to survey
-      // coordinates preserves convexity, so hulling in scene space first is
-      // both exact and far cheaper than transforming millions of vertices.
-      elementHull: (elements) => viewer.elementHull(elements),
-      modelHull: () => viewer.modelHull(),
-      groundLevel: () => viewer.groundLevel(),
-    },
-  };
-
-  try {
-    checkOutcomes = await runChecks(ids, ctx, (msg) => {
-      el.issues.innerHTML = `<div class="empty-note">${esc(msg)}</div>`;
-    });
-    renderSummary();
-    renderCheckResults();
-    renderCheckMenu();
-    el.btnColourStatus.disabled = !checkOutcomes.some((o) => o.result);
-
-    const broken = checkOutcomes.filter((o) => o.error);
-    if (broken.length) {
-      toast(`${broken.length} check${broken.length > 1 ? 's' : ''} could not run — see the browser console.`);
+  setTimeout(() => {
+    try {
+      checkResult = runCheck(index, ruleset, (t) =>
+        (!gatewayFilter || t.gateway === gatewayFilter) &&
+        (!agencyFilter || t.agency === agencyFilter) &&
+        (!discipline || t.discipline === discipline));
+      renderSummary();
+      renderIssues();
+      el.btnColourStatus.disabled = false;
+    } catch (err) {
+      console.error(err);
+      toast('The compliance check failed — see the browser console.');
+    } finally {
+      el.btnRunCheck.disabled = false;
+      el.btnRunCheck.textContent = 'Run compliance check';
     }
-  } catch (err) {
-    console.error(err);
-    toast('The compliance check failed — see the browser console.');
-  } finally {
-    checkRunning = false;
-    updateRunButton();
-  }
+  }, 20);
 }
 
 /** Headline numbers across every check that ran. */
 function renderSummary() {
   const t = totalsOf(checkOutcomes);
   const pct = t.assertions ? Math.round((t.pass / t.assertions) * 100) : 0;
-  const scope = [el.fAgency.value, el.fDiscipline.value].filter(Boolean).join(' · ') || 'All agencies';
+  const scope = [gatewayFilter && GATEWAY_LABEL[gatewayFilter], agencyFilter, el.fDiscipline.value]
+    .filter(Boolean).join(' · ') || 'All gateways';
   const names = checkOutcomes.filter((o) => o.result).map((o) => o.meta.title).join(', ');
 
   el.summary.classList.add('visible');
@@ -1350,6 +1587,9 @@ function showMetricInModel(metric) {
 // ------------------------------------------------------------- element inspector
 
 function onPick(hit) {
+  // A section drag ends with a click on the same element; while armed, that
+  // click is drawing intent, not a pick.
+  if (sectionArmed) return;
   if (!hit || !index) {
     el.panel.classList.remove('visible');
     return;
