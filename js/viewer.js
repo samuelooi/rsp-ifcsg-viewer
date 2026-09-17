@@ -17,6 +17,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { IFCLoader } from 'web-ifc-three/IFCLoader';
+import { convexHull } from './geo/polygon.js';
 
 const WASM_PATH = 'https://unpkg.com/web-ifc@0.0.36/';
 
@@ -109,6 +110,7 @@ export class Viewer {
 
     this.groups = [];            // [{ elements, colour }] from the active query
     this.overlays = [];          // created subsets, tracked for exact teardown
+    this.surveyOverlays = [];    // cadastral / site-boundary polygons, see setSurveyOverlays
     this.contextMode = 'ghost';  // how un-selected geometry is drawn during a query
     this.hiddenVersion = 0;      // bumped on every visibility change, see _applyHidden
     this.wireframe = false;
@@ -212,6 +214,9 @@ export class Viewer {
       const entry = {
         modelID,
         name: file.name,
+        // Kept because CORENET X caps each submitted file, and the source file
+        // is gone by the time a check runs.
+        bytes: file.size || 0,
         mesh,
         baseMaterials,
         ghostMaterials,
@@ -297,6 +302,54 @@ export class Viewer {
   /** The raw web-ifc API, for the property index. */
   get api() {
     return this.loader.ifcManager.state.api;
+  }
+
+  // ------------------------------------------------------------------ memory
+
+  /**
+   * Bytes held in vertex and index buffers across every loaded model, its
+   * overlay subsets, and web-ifc-three's per-model index caches.
+   *
+   * Subsets share the base mesh's position, normal and expressID attributes by
+   * reference and only own their index, so attributes are counted once each.
+   */
+  geometryBytes() {
+    const seen = new Set();
+    let bytes = 0;
+    const count = (attr) => {
+      if (!attr || !attr.array || seen.has(attr)) return;
+      seen.add(attr);
+      bytes += attr.array.byteLength;
+    };
+    const countGeometry = (geometry) => {
+      if (!geometry) return;
+      for (const attr of Object.values(geometry.attributes)) count(attr);
+      count(geometry.index);
+    };
+
+    for (const entry of this.models.values()) countGeometry(entry.mesh.geometry);
+    for (const o of this.overlays) if (o.mesh) countGeometry(o.mesh.geometry);
+
+    // The pristine index copy kept for hiding and subsets, per model.
+    const maps = this.loader.ifcManager.subsets.items.map || {};
+    for (const m of Object.values(maps)) {
+      if (m && m.indexCache) bytes += m.indexCache.byteLength;
+    }
+    return bytes;
+  }
+
+  /**
+   * Size of the web-ifc wasm heap. It grows to fit the largest file parsed and
+   * is never returned to the browser, so this is a floor for the session.
+   */
+  wasmHeapBytes() {
+    try {
+      const mod = this.api && this.api.wasmModule;
+      const heap = mod && (mod.HEAPU8 || mod.HEAP8);
+      return heap ? heap.byteLength : 0;
+    } catch {
+      return 0;
+    }
   }
 
   /** The web-ifc model handle backing a loaded mesh, found by identity. */
@@ -499,9 +552,272 @@ export class Viewer {
     }
   }
 
+  // ------------------------------------------------------- geometry sampling
+
+  /**
+   * Scene-space vertices belonging to one element.
+   *
+   * Reads the same per-element index ranges the hiding uses, so it works after
+   * the parsed IFC has been released — there is no other way to get an
+   * element's geometry once the wasm model is closed.
+   *
+   * @returns {THREE.Vector3[]} deduplicated, capped at `limit`
+   */
+  elementPoints(modelID, expressID, limit = 20000) {
+    const entry = this.models.get(modelID);
+    if (!entry) return [];
+    const items = this._itemsMap(modelID);
+    const byMaterial = items && items.map.get(expressID);
+    if (!byMaterial) return [];
+
+    const position = entry.mesh.geometry.attributes.position;
+    const cache = items.indexCache;
+    const seen = new Set();
+    const points = [];
+
+    for (const ranges of Object.values(byMaterial)) {
+      for (let p = 0; p < ranges.length; p += 2) {
+        for (let j = ranges[p]; j <= ranges[p + 1] && points.length < limit; j++) {
+          const vi = cache[j];
+          if (seen.has(vi)) continue;
+          seen.add(vi);
+          points.push(new THREE.Vector3(
+            position.getX(vi), position.getY(vi), position.getZ(vi)));
+        }
+      }
+    }
+    return points;
+  }
+
+  /**
+   * Ground-plane convex hull over every vertex a callback yields, as `[[x, z], …]`
+   * in scene coordinates.
+   *
+   * **Exact, not sampled.** An earlier version sampled every fourteenth vertex,
+   * which is fine for drawing and wrong for a containment test: the hull of a
+   * sample is contained by the true hull, so a corner poking over a boundary can
+   * be missed entirely. A check that quietly under-reports is worse than none.
+   *
+   * Exactness is affordable because of the prefilter. One pass finds the extreme
+   * point in eight directions; those eight are genuine hull vertices, so the
+   * octagon they span lies inside the true hull and every point within it is
+   * provably not a hull vertex. A second pass discards those — on building
+   * geometry, virtually all of them — and only the survivors are sorted.
+   */
+  _groundHull(iterate) {
+    const DIRS = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]];
+    const best = DIRS.map(() => ({ score: -Infinity, point: null }));
+
+    iterate((x, z) => {
+      for (let i = 0; i < 8; i++) {
+        const score = DIRS[i][0] * x + DIRS[i][1] * z;
+        if (score > best[i].score) {
+          best[i].score = score;
+          best[i].point = [x, z];
+        }
+      }
+    });
+
+    const extremes = best.map((b) => b.point).filter(Boolean);
+    if (extremes.length < 3) return extremes;
+
+    const octagon = convexHull(extremes);
+    const candidates = extremes.slice();
+
+    if (octagon.length >= 3) {
+      // Strictly-inside test against a counter-clockwise convex polygon.
+      const inside = (x, z) => {
+        for (let i = 0, n = octagon.length; i < n; i++) {
+          const [ax, az] = octagon[i];
+          const [bx, bz] = octagon[(i + 1) % n];
+          if ((bx - ax) * (z - az) - (bz - az) * (x - ax) < 0) return false;
+        }
+        return true;
+      };
+      iterate((x, z) => { if (!inside(x, z)) candidates.push([x, z]); });
+    } else {
+      iterate((x, z) => candidates.push([x, z]));
+    }
+
+    return convexHull(candidates);
+  }
+
+  /** Ground-plane hull of every visible model, in scene coordinates. */
+  modelHull() {
+    const meshes = [];
+    for (const entry of this.models.values()) {
+      if (entry.visible) meshes.push(entry.mesh.geometry.attributes.position);
+    }
+    if (!meshes.length) return [];
+
+    return this._groundHull((cb) => {
+      for (const position of meshes) {
+        const arr = position.array;
+        for (let i = 0, n = position.count; i < n; i++) cb(arr[i * 3], arr[i * 3 + 2]);
+      }
+    });
+  }
+
+  /** Ground-plane hull of specific elements, in scene coordinates. */
+  elementHull(elements) {
+    const perModel = new Map();
+    for (const el of elements || []) {
+      if (!perModel.has(el.modelID)) perModel.set(el.modelID, []);
+      perModel.get(el.modelID).push(el.expressID);
+    }
+
+    const sources = [];
+    for (const [modelID, ids] of perModel) {
+      const entry = this.models.get(modelID);
+      if (!entry) continue;
+      const items = this._itemsMap(modelID);
+      if (!items) continue;
+      sources.push({ position: entry.mesh.geometry.attributes.position, items, ids });
+    }
+    if (!sources.length) return [];
+
+    return this._groundHull((cb) => {
+      for (const { position, items, ids } of sources) {
+        const arr = position.array;
+        const cache = items.indexCache;
+        for (const expressID of ids) {
+          const byMaterial = items.map.get(expressID);
+          if (!byMaterial) continue;
+          for (const ranges of Object.values(byMaterial)) {
+            for (let p = 0; p < ranges.length; p += 2) {
+              for (let j = ranges[p]; j <= ranges[p + 1]; j++) {
+                const vi = cache[j];
+                cb(arr[vi * 3], arr[vi * 3 + 2]);
+              }
+            }
+          }
+        }
+      }
+    });
+  }
+
+  /** Lowest point of the visible models, where ground-plane overlays are drawn. */
+  groundLevel() {
+    let min = Infinity;
+    for (const entry of this.models.values()) {
+      if (!entry.visible) continue;
+      const g = entry.mesh.geometry;
+      if (!g.boundingBox) g.computeBoundingBox();
+      if (g.boundingBox && g.boundingBox.min.y < min) min = g.boundingBox.min.y;
+    }
+    return Number.isFinite(min) ? min : 0;
+  }
+
+  // -------------------------------------------------------- survey overlays
+
+  /**
+   * Draws flat polygons on the ground plane — the cadastral lot and the site
+   * boundary the geo-referencing check compares.
+   *
+   * These are not model geometry: they are drawn from survey coordinates, sit
+   * outside the hiding and colouring machinery entirely, and are never picked.
+   *
+   * @param {Array<{points: THREE.Vector3[], colour: number, opacity?: number,
+   *                fill?: boolean, elevation?: number}>} polygons
+   */
+  setSurveyOverlays(polygons) {
+    this.clearSurveyOverlays();
+    if (!polygons || !polygons.length) return;
+
+    for (const poly of polygons) {
+      const pts = poly.points || [];
+      if (pts.length < 3) continue;
+      const y = poly.elevation !== undefined ? poly.elevation : this.groundLevel();
+
+      // Outline. Drawn slightly above the fill so it is never z-fought away.
+      const outline = new THREE.BufferGeometry().setFromPoints(
+        pts.map((p) => new THREE.Vector3(p.x, y + 0.06, p.z)));
+      const lineMaterial = new THREE.LineBasicMaterial({
+        color: new THREE.Color(poly.colour), depthTest: false, transparent: true,
+      });
+      const line = new THREE.LineLoop(outline, lineMaterial);
+      line.renderOrder = 999;
+      this.scene.add(line);
+      this.surveyOverlays.push({ object: line, geometry: outline, material: lineMaterial });
+
+      if (poly.fill === false) continue;
+
+      // Fill. Triangulated properly rather than fanned, because a cadastral lot
+      // is routinely concave and a fan would spill outside it.
+      const contour = pts.map((p) => new THREE.Vector2(p.x, p.z));
+      let faces = [];
+      try {
+        faces = THREE.ShapeUtils.triangulateShape(contour, []);
+      } catch {
+        faces = [];
+      }
+      if (!faces.length) continue;
+
+      const positions = new Float32Array(faces.length * 9);
+      let k = 0;
+      for (const [a, b, c] of faces) {
+        for (const i of [a, b, c]) {
+          positions[k++] = contour[i].x;
+          positions[k++] = y + 0.02;
+          positions[k++] = contour[i].y;
+        }
+      }
+      const fillGeometry = new THREE.BufferGeometry();
+      fillGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      const fillMaterial = new THREE.MeshBasicMaterial({
+        color: new THREE.Color(poly.colour),
+        transparent: true,
+        opacity: poly.opacity === undefined ? 0.25 : poly.opacity,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      });
+      const mesh = new THREE.Mesh(fillGeometry, fillMaterial);
+      mesh.renderOrder = 998;
+      this.scene.add(mesh);
+      this.surveyOverlays.push({ object: mesh, geometry: fillGeometry, material: fillMaterial });
+    }
+  }
+
+  clearSurveyOverlays() {
+    for (const o of this.surveyOverlays) {
+      this.scene.remove(o.object);
+      o.geometry.dispose();
+      o.material.dispose();
+    }
+    this.surveyOverlays = [];
+  }
+
+  get hasSurveyOverlays() {
+    return this.surveyOverlays.length > 0;
+  }
+
+  /** Frames the camera on the survey overlays plus the models. */
+  fitSurvey() {
+    if (!this.surveyOverlays.length) return this.fit();
+    const box = new THREE.Box3();
+    for (const o of this.surveyOverlays) box.expandByObject(o.object);
+    for (const entry of this.models.values()) {
+      if (entry.visible) box.union(new THREE.Box3().setFromObject(entry.mesh));
+    }
+    if (box.isEmpty()) return this.fit();
+
+    const size = box.getSize(new THREE.Vector3());
+    const center = box.getCenter(new THREE.Vector3());
+    const maxDim = Math.max(size.x, size.y, size.z) || 10;
+    const dist = maxDim * 1.3;
+    this.camera.position.set(center.x + dist * 0.6, center.y + dist, center.z + dist * 0.6);
+    this.camera.near = maxDim / 200;
+    this.camera.far = maxDim * 60;
+    this.camera.updateProjectionMatrix();
+    this.controls.target.copy(center);
+    this.controls.update();
+    return undefined;
+  }
+
   reset() {
     this.groups = [];
     this.contextMode = 'ghost';
+    this.clearSurveyOverlays();
     this.refresh();
   }
 

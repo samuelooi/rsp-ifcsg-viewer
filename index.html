@@ -74,6 +74,22 @@
   .ruleset-badge b { color: var(--text-muted); font-weight: 600; }
   .ruleset-badge.err { border-color: var(--danger); color: var(--danger); }
 
+  /* Memory meter: estimated tab memory against the session budget. */
+  .mem {
+    display: flex; align-items: center; gap: 7px;
+    font-size: 11px; color: var(--text-dim); white-space: nowrap;
+    border: 1px solid var(--border); border-radius: 999px; padding: 3px 9px;
+    cursor: default;
+  }
+  .mem .mem-track { width: 72px; height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; }
+  .mem .mem-fill { height: 100%; width: 0; background: var(--ok); transition: width .3s ease, background .3s ease; }
+  .mem .mem-val { color: var(--text-muted); font-variant-numeric: tabular-nums; }
+  .mem.warn { border-color: var(--warn); }
+  .mem.warn .mem-fill { background: var(--warn); }
+  .mem.danger { border-color: var(--danger); }
+  .mem.danger .mem-fill { background: var(--danger); }
+  .mem.danger .mem-val { color: var(--danger); }
+
   .btn {
     background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
     font-size: 12.5px; font-family: inherit; padding: 7px 12px;
@@ -198,6 +214,77 @@
 
   /* Check tab */
   .check-actions { padding: 10px; border-bottom: 1px solid var(--border); display: flex; gap: 6px; }
+
+  /* Check selection menu: which authority checks to run. */
+  .check-menu { border-bottom: 1px solid var(--border); max-height: 40%; overflow-y: auto; }
+  .cm-group { padding: 6px 0; }
+  .cm-group + .cm-group { border-top: 1px solid #2e333c; }
+  .cm-head {
+    padding: 5px 10px 3px; font-size: 10px; letter-spacing: .09em;
+    color: var(--text-dim); text-transform: uppercase;
+  }
+  .cm-row {
+    display: flex; gap: 8px; align-items: flex-start;
+    padding: 6px 10px; cursor: pointer;
+  }
+  .cm-row:hover { background: var(--panel-2); }
+  .cm-row input { margin: 2px 0 0; accent-color: var(--accent); flex-shrink: 0; }
+  .cm-text { min-width: 0; }
+  .cm-name {
+    display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+    font-size: 12.5px; color: var(--text);
+  }
+  .cm-text small {
+    display: block; color: var(--text-dim); font-size: 10.5px;
+    line-height: 1.45; margin-top: 2px;
+  }
+  .cm-tag, .cm-chip {
+    font-size: 9.5px; letter-spacing: .04em; text-transform: uppercase;
+    padding: 1px 5px; border-radius: 999px; white-space: nowrap;
+    background: var(--panel-3); color: var(--text-dim); border: 1px solid var(--border);
+  }
+  .cm-chip.ok { background: #27402a; color: #86c086; border-color: transparent; }
+  .cm-chip.bad { background: #4a2a22; color: #e59277; border-color: transparent; }
+
+  /* Extra input a check declares — a cadastral lot file, surveyed vertices. */
+  .cm-inputs { padding: 2px 10px 10px 30px; }
+  .cm-input + .cm-input { margin-top: 9px; }
+  .cm-input-label { font-size: 11px; color: var(--text-muted); margin-bottom: 4px; }
+  .cm-file { display: flex; align-items: center; gap: 6px; }
+  .cm-filename {
+    font-size: 11px; color: var(--text-dim); flex: 1; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .cm-textin, .cm-select {
+    width: 100%; background: var(--panel-2); border: 1px solid var(--border);
+    color: var(--text); font-family: inherit; font-size: 11.5px;
+    padding: 5px 7px; border-radius: var(--radius);
+  }
+  .cm-select { cursor: pointer; }
+  .cm-help { font-size: 10px; color: var(--text-dim); line-height: 1.45; margin-top: 4px; }
+
+  /* Key/value facts a check reports above its findings. */
+  .geo-facts {
+    display: grid; grid-template-columns: auto 1fr; gap: 3px 10px;
+    padding: 9px 10px; font-size: 11px; border-bottom: 1px solid #2e333c;
+  }
+  .geo-facts .k { color: var(--text-dim); }
+  .geo-facts .v { color: var(--text); text-align: right; font-variant-numeric: tabular-nums; }
+
+  /* One results section per check that ran. */
+  .check-result + .check-result { border-top: 2px solid var(--border); }
+  .cr-head {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 10px; background: var(--panel-2);
+    position: sticky; top: 0; z-index: 1;
+  }
+  .cr-title { flex: 1; font-size: 12.5px; min-width: 0; }
+  .cr-title small { display: block; color: var(--text-dim); font-size: 10.5px; }
+  .cr-note {
+    padding: 7px 10px; font-size: 11px; color: var(--text-dim);
+    line-height: 1.5; border-bottom: 1px solid #2e333c;
+  }
+  .pill.ok { background: #27402a; color: #86c086; }
   .summary { padding: 10px; border-bottom: 1px solid var(--border); display: none; }
   .summary.visible { display: block; }
   .sbar { display: flex; height: 6px; border-radius: 3px; overflow: hidden; margin-bottom: 8px; background: var(--panel-2); }
@@ -213,7 +300,7 @@
   .issue-head:hover { background: var(--panel-2); }
   .issue-head .iname { flex: 1; font-size: 12.5px; min-width: 0; }
   .issue-head .iname small { display: block; color: var(--text-dim); font-size: 10.5px; }
-  .issue-head .pill {
+  .pill {
     font-size: 10.5px; padding: 1px 7px; border-radius: 999px;
     font-variant-numeric: tabular-nums; flex-shrink: 0;
   }
@@ -451,6 +538,11 @@
     </svg>
     <span id="filename" class="filename">No model loaded</span>
     <div class="spacer"></div>
+    <div class="mem" id="mem" title="Estimated tab memory">
+      <span>Memory</span>
+      <div class="mem-track"><div class="mem-fill" id="mem-fill"></div></div>
+      <span class="mem-val" id="mem-val">—</span>
+    </div>
     <span class="ruleset-badge" id="ruleset-badge">Loading ruleset…</span>
     <button class="btn" id="btn-dash" disabled>Dashboard</button>
     <button class="btn" id="btn-reset" title="Reset view" disabled>Reset view</button>
@@ -486,8 +578,9 @@
 
     <!-- Check tab -->
     <div id="tab-check" style="display:none;flex-direction:column;flex:1;overflow:hidden;">
+      <div class="check-menu" id="check-menu"></div>
       <div class="check-actions">
-        <button class="btn primary" id="btn-run-check" disabled>Run compliance check</button>
+        <button class="btn primary" id="btn-run-check" disabled>Select a check</button>
         <button class="btn" id="btn-colour-status" disabled title="Colour the model by check status">Colour</button>
       </div>
       <div class="summary" id="summary"></div>
@@ -502,6 +595,9 @@
     </div>
     <div class="rail-btn" id="tool-spaces" title="Show IfcSpace volumes">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3 7l9-4 9 4v10l-9 4-9-4V7z"/><path d="M3 7l9 4 9-4M12 11v10"/></svg>
+    </div>
+    <div class="rail-btn" id="tool-survey" title="No survey outlines drawn">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3 20l6-16 6 16M3 20l9-5 9 5M21 20L15 4"/></svg>
     </div>
     <div class="rail-btn" id="tool-showall" title="Show all hidden elements">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 12s3.5-6.5 10-6.5S22 12 22 12s-3.5 6.5-10 6.5S2 12 2 12z"/><circle cx="12" cy="12" r="2.6"/></svg>

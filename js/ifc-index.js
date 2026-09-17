@@ -95,6 +95,113 @@ function readProperty(p) {
   return { name, value };
 }
 
+/** SI prefix -> multiplier, for resolving the project's length unit. */
+const SI_PREFIX = {
+  EXA: 1e18, PETA: 1e15, TERA: 1e12, GIGA: 1e9, MEGA: 1e6, KILO: 1e3,
+  HECTO: 1e2, DECA: 1e1, DECI: 1e-1, CENTI: 1e-2, MILLI: 1e-3,
+  MICRO: 1e-6, NANO: 1e-9, PICO: 1e-12, FEMTO: 1e-15, ATTO: 1e-18,
+};
+
+
+/**
+ * Captures how the model is tied to the real world.
+ *
+ * This has to happen while the parsed IFC is still open. The viewer releases it
+ * as soon as indexing finishes, and nothing afterwards can read a line again —
+ * so georeferencing, like everything else the app needs, is read once here.
+ *
+ * Three sources, in descending order of trustworthiness:
+ *
+ *  - **IfcMapConversion + IfcProjectedCRS** — the only one that actually defines
+ *    a transform: an offset, a rotation and a scale onto a named CRS.
+ *  - **IfcSite RefLatitude / RefLongitude** — a single point with no rotation.
+ *    Useful to cross-check the above, not to replace it.
+ *  - **Nothing** — the model is not georeferenced.
+ */
+export function readGeoreference(api, modelID) {
+  const first = (type) => {
+    try {
+      const ids = api.GetLineIDsWithType(modelID, type);
+      return ids.size() ? api.GetLine(modelID, ids.get(0), false) : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const num = (v) => {
+    const raw = v && typeof v === 'object' && 'value' in v ? v.value : v;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : null;
+  };
+
+  // ---- project length unit, so the map conversion's scale can be interpreted
+  let metresPerUnit = 1;
+  let lengthUnitName = 'METRE';
+  try {
+    const ids = api.GetLineIDsWithType(modelID, WebIFC.IFCPROJECT);
+    if (ids.size()) {
+      const project = api.GetLine(modelID, ids.get(0), true);
+      const units = project && project.UnitsInContext && project.UnitsInContext.Units;
+      for (const u of units || []) {
+        const type = unwrap(u && u.UnitType);
+        const name = unwrap(u && u.Name);
+        if (type !== 'LENGTHUNIT' || !name) continue;
+        const prefix = unwrap(u.Prefix);
+        metresPerUnit = prefix && SI_PREFIX[prefix] ? SI_PREFIX[prefix] : 1;
+        lengthUnitName = (prefix ? prefix + ' ' : '') + name;
+        break;
+      }
+    }
+  } catch { /* unusual unit assignment; metres is the safe assumption */ }
+
+  // ---- map conversion
+  const mc = first(WebIFC.IFCMAPCONVERSION);
+  let mapConversion = null;
+  if (mc) {
+    const abscissa = num(mc.XAxisAbscissa);
+    const ordinate = num(mc.XAxisOrdinate);
+    mapConversion = {
+      eastings: num(mc.Eastings) || 0,
+      northings: num(mc.Northings) || 0,
+      orthogonalHeight: num(mc.OrthogonalHeight) || 0,
+      // The rotation is given as a direction rather than an angle. A missing
+      // pair means "no rotation", which is not the same as pointing at zero.
+      rotation: abscissa === null && ordinate === null
+        ? 0 : Math.atan2(ordinate || 0, abscissa === null ? 1 : abscissa),
+      scale: num(mc.Scale) === null ? 1 : num(mc.Scale),
+    };
+  }
+
+  // ---- projected CRS
+  const crsLine = first(WebIFC.IFCPROJECTEDCRS);
+  const crs = crsLine ? {
+    name: unwrap(crsLine.Name),
+    description: unwrap(crsLine.Description),
+    geodeticDatum: unwrap(crsLine.GeodeticDatum),
+    mapProjection: unwrap(crsLine.MapProjection),
+    mapZone: unwrap(crsLine.MapZone),
+  } : null;
+
+  // ---- site reference position: the first site that actually declares one
+  let site = null;
+  try {
+    const ids = api.GetLineIDsWithType(modelID, WebIFC.IFCSITE);
+    for (let i = 0; i < ids.size(); i++) {
+      const line = api.GetLine(modelID, ids.get(i), false);
+      if (!line || (!line.RefLatitude && !line.RefLongitude)) continue;
+      site = {
+        name: unwrap(line.Name),
+        refLatitude: line.RefLatitude,
+        refLongitude: line.RefLongitude,
+        refElevation: num(line.RefElevation),
+      };
+      break;
+    }
+  } catch { /* no sites */ }
+
+  return { mapConversion, crs, site, metresPerUnit, lengthUnitName };
+}
+
 /**
  * @param {WebIFC.IfcAPI} api
  * @param {number} modelID        the web-ifc model handle
@@ -226,19 +333,103 @@ export function buildIndex(api, modelID, ruleset, onProgress = () => {}) {
   // ------------------------------------------------------- spatial structure
   onProgress('Resolving spatial structure…', 80);
 
+  const georef = readGeoreference(api, modelID);
+
+  /**
+   * Absolute height of a placement, by walking the chain to the project origin.
+   *
+   * A storey's `Elevation` attribute is relative to whatever spatial element
+   * contains it, so two files can quote the same number for different heights.
+   * Accumulating the placement chain gives one datum every file can be compared
+   * against — which is what checking level consistency across a federated set
+   * requires. Only the Z translation is accumulated; storeys are not tilted, and
+   * a rotation about Z does not change height.
+   */
+  function placementHeight(placementID) {
+    let z = 0;
+    let current = placementID;
+    for (let hops = 0; current != null && hops < 32; hops++) {
+      let line;
+      try {
+        line = api.GetLine(modelID, current, false);
+      } catch {
+        break;
+      }
+      if (!line) break;
+      const rel = line.RelativePlacement;
+      if (rel && rel.value !== undefined) {
+        try {
+          const axis = api.GetLine(modelID, rel.value, false);
+          const loc = axis && axis.Location;
+          if (loc && loc.value !== undefined) {
+            const point = api.GetLine(modelID, loc.value, false);
+            const coords = point && point.Coordinates;
+            if (Array.isArray(coords) && coords.length >= 3) {
+              const v = unwrap(coords[2]);
+              if (Number.isFinite(Number(v))) z += Number(v);
+            }
+          }
+        } catch { /* malformed placement; treat this link as zero */ }
+      }
+      current = line.PlacementRelTo && line.PlacementRelTo.value !== undefined
+        ? line.PlacementRelTo.value : null;
+    }
+    return z;
+  }
+
   // An element's "level" must be a storey. Containment can point at any spatial
   // element though — a bin sitting in a room is contained by the IfcSpace, not
   // the storey — so build the spatial hierarchy first and walk up from whatever
   // the relationship names until a storey is reached.
   const storeyNames = new Map();   // expressID -> storey name
   const parentOf = new Map();      // spatial expressID -> containing expressID
+  const storeys = [];              // [{ expressID, name, elevation, declared, unit, … }]
+
+  /**
+   * Lengths are reported in millimetres, whatever unit the file was authored in.
+   *
+   * Two reasons. A federated set can mix units, and normalising here means
+   * everything downstream compares like with like without carrying a unit
+   * around. And millimetres are what the modeller drew in: a level set out at
+   * -500 should read as -500, not as -0.5.
+   *
+   * The rounding matters as much as the unit. Exporters emit -499.9999999999913
+   * for what was drawn as -500, and that noise would otherwise read as a genuine
+   * disagreement between two levels.
+   */
+  const metresPerUnit = georef.metresPerUnit || 1;
+  const toMm = (n) => (Number.isFinite(n)
+    ? Math.round(n * metresPerUnit * 1000 * 1000) / 1000
+    : null);
 
   try {
     const ids = api.GetLineIDsWithType(modelID, WebIFC.IFCBUILDINGSTOREY);
     for (let i = 0; i < ids.size(); i++) {
       const id = ids.get(i);
       try {
-        storeyNames.set(id, unwrap(api.GetLine(modelID, id, false).Name));
+        const line = api.GetLine(modelID, id, false);
+        const name = unwrap(line.Name);
+        storeyNames.set(id, name);
+
+        const declared = Number(unwrap(line.Elevation));
+        const placement = line.ObjectPlacement && line.ObjectPlacement.value !== undefined
+          ? placementHeight(line.ObjectPlacement.value) : null;
+
+        // Absolute, from the placement chain; the declared attribute is the
+        // fallback and is kept so a disagreement between them is visible.
+        const absolute = placement !== null ? placement
+          : (Number.isFinite(declared) ? declared : 0);
+
+        storeys.push({
+          modelID,
+          expressID: id,
+          name,
+          // Millimetres, normalised from whatever the file was authored in.
+          elevation: toMm(absolute),
+          declared: Number.isFinite(declared) ? toMm(declared) : null,
+          unit: 'mm',
+          resolved: placement !== null,
+        });
       } catch { /* unreadable storey */ }
     }
   } catch { /* no storeys */ }
@@ -305,6 +496,8 @@ export function buildIndex(api, modelID, ruleset, onProgress = () => {}) {
     byEntity,
     all,
     count: all.length,
+    georef,
+    storeys,
   };
 }
 
@@ -317,6 +510,13 @@ export function mergeIndexes(indexes) {
   const byEntity = new Map();
   const all = [];
 
+  // The first model loaded establishes the datum every later model is placed
+  // against, so its georeferencing is the one that describes the scene. Keep
+  // the others so a check can report a file that disagrees with the datum.
+  const georef = indexes.length ? indexes[0].georef : null;
+  const georefByModel = new Map(indexes.map((idx) => [idx.modelID, idx.georef]));
+  const storeys = indexes.flatMap((idx) => idx.storeys || []);
+
   for (const idx of indexes) {
     for (const el of idx.all) {
       byId.set(el.key, el);
@@ -326,5 +526,5 @@ export function mergeIndexes(indexes) {
     }
   }
 
-  return { byId, byEntity, all, count: all.length };
+  return { byId, byEntity, all, count: all.length, georef, georefByModel, storeys };
 }

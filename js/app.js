@@ -12,11 +12,18 @@
 import { Viewer } from './viewer.js';
 import { buildIndex, mergeIndexes } from './ifc-index.js';
 import { DASHBOARD_ENTITIES, computeDashboard, formatValue as fmtNum } from './dashboard.js';
+import { measure, project, formatBytes, LEVEL } from './memory.js';
 import {
-  loadRuleset, selectElements, groupByValue, runCheck, evaluate,
-  describeSubtypes, matchesTarget, formatValue, isEmptyValue,
-  STATUS, STATUS_LABEL,
+  loadRuleset, selectElements, groupByValue,
+  describeSubtypes, formatValue, isEmptyValue,
 } from './ifcsg.js';
+import { buildTransform } from './geo/georef.js';
+import * as registry from './checks/registry.js';
+import { runChecks, totalsOf } from './checks/runner.js';
+import {
+  SEVERITY, SEVERITY_LABEL, SEVERITY_COLOUR, SEVERITY_ORDER, worstOf,
+} from './checks/severity.js';
+import { esc, hex } from './util/dom.js';
 
 // ---------------------------------------------------------------------- colours
 
@@ -28,14 +35,8 @@ const PALETTE = [
 const MISSING_COLOUR = 0xd16a4f;   // same hue as --danger: an unset value is a gap
 const SINGLE_COLOUR = 0x4fa3d1;
 
-const STATUS_COLOUR = {
-  [STATUS.PASS]: 0x5aa65a,
-  [STATUS.MISSING_PSET]: 0xd16a4f,
-  [STATUS.MISSING_PROP]: 0xc4563c,
-  [STATUS.EMPTY]: 0xb0763c,
-  [STATUS.INVALID_VALUE]: 0xd4a13c,
-  [STATUS.INVALID_TYPE]: 0xc06c84,
-};
+/** Where the selected checks are remembered between sessions. */
+const SELECTION_KEY = 'rsp-ifcsg.checks';
 
 // ------------------------------------------------------------------------ state
 
@@ -53,7 +54,16 @@ let selection = null;      // { target, req }  req may be null (whole component)
 let legend = [];           // [{ label, colour, elements, missing }]
 let soloIndex = -1;
 let contextMode = 'ghost'; // 'ghost' | 'hidden' | 'normal'
-let checkResult = null;
+
+/** Results of the last run, one entry per selected check. */
+let checkOutcomes = [];
+/** Check ids the user has ticked in the menu. */
+let selectedChecks = new Set();
+/** "<checkId>.<inputId>" -> the value the user supplied (a string, or {name, text}). */
+const checkInputs = new Map();
+let checkRunning = false;
+/** Aborts an in-flight run when the model changes or a new run starts. */
+let checkAbort = null;
 
 // Visibility policy. The viewer holds the resulting set; these two own the intent.
 const manualHidden = new Set();   // element keys hidden via the context menu
@@ -71,25 +81,21 @@ const el = {
   fAgency: $('f-agency'), fDiscipline: $('f-discipline'), fSearch: $('f-search'), fPresent: $('f-present'),
   tree: $('tree'), legend: $('legend'), legendTitle: $('legend-title'), legendRows: $('legend-rows'),
   btnClearQuery: $('btn-clear-query'),
+  checkMenu: $('check-menu'),
   btnRunCheck: $('btn-run-check'), btnColourStatus: $('btn-colour-status'),
   summary: $('summary'), issues: $('issues'),
   panel: $('panel'), panelBody: $('panel-body'), panelClose: $('panel-close'),
   toolCollapse: $('tool-collapse'), toolGhost: $('tool-ghost'), toolSpaces: $('tool-spaces'),
   toolShowAll: $('tool-showall'), toolWireframe: $('tool-wireframe'), toolFit: $('tool-fit'),
+  toolSurvey: $('tool-survey'),
   ctxmenu: $('ctxmenu'),
   btnDash: $('btn-dash'), dash: $('dash'), dashBody: $('dash-body'),
   dashSub: $('dash-sub'), dashSeg: $('dash-seg'), dashClose: $('dash-close'),
+  mem: $('mem'), memFill: $('mem-fill'), memVal: $('mem-val'),
 };
 
 /** Which breakdown the dashboard cards show: 'level' | 'file' | 'none'. */
 let dashBreakdown = 'level';
-
-const esc = (s) => {
-  const d = document.createElement('div');
-  d.textContent = s === null || s === undefined ? '' : String(s);
-  return d.innerHTML;
-};
-const hex = (n) => '#' + n.toString(16).padStart(6, '0');
 
 function toast(msg) {
   el.toast.textContent = msg;
@@ -103,6 +109,44 @@ function setProgress(pct, label) {
   if (label) el.loadingLabel.textContent = label;
 }
 
+// ---------------------------------------------------------------------- memory
+
+/** Set once the meter enters the danger band, so the warning fires once per crossing. */
+let memoryWarned = false;
+
+/** Refreshes the top-bar memory meter from the current estimate. */
+function renderMemory() {
+  if (!viewer) return;
+  const m = measure(viewer);
+  const pct = Math.min(100, Math.round(m.ratio * 100));
+
+  el.memFill.style.width = pct + '%';
+  el.memVal.textContent = `${formatBytes(m.total)} / ${formatBytes(m.budget)}`;
+  el.mem.classList.toggle('warn', m.level === LEVEL.WARN);
+  el.mem.classList.toggle('danger', m.level === LEVEL.DANGER);
+  el.mem.title = [
+    `Estimated tab memory: ${formatBytes(m.total)} of a ${formatBytes(m.budget)} budget (${pct}%)`,
+    `Geometry buffers: ${formatBytes(m.geometry)}`,
+    `web-ifc wasm heap: ${formatBytes(m.wasm)}`,
+    m.jsHeap === null
+      ? 'JavaScript heap: not reported by this browser'
+      : `JavaScript heap: ${formatBytes(m.jsHeap)}`,
+    '',
+    'Geometry and wasm figures are exact. The ceiling is a budget rather than a',
+    'hard limit; override it with ?membudget=<GiB> in the URL.',
+  ].join('\n');
+
+  if (m.level === LEVEL.DANGER) {
+    if (!memoryWarned) {
+      memoryWarned = true;
+      toast(`Memory is at ${pct}% of the ${formatBytes(m.budget)} budget. ` +
+        'Close a model before adding more, or the browser tab may run out of memory.');
+    }
+  } else {
+    memoryWarned = false;
+  }
+}
+
 // ------------------------------------------------------------------------- boot
 
 async function init() {
@@ -111,13 +155,31 @@ async function init() {
   viewer.onContextMenu(openContextMenu);
 
   wireUI();
+  renderMemory();
+  // The JS heap moves on its own, so keep the meter live rather than event-driven.
+  setInterval(renderMemory, 2000);
+
+  selectedChecks = loadSelection();
+  renderCheckMenu();
 
   try {
     ruleset = await loadRuleset();
+
+    // The model is walked once and the parsed IFC is released straight after, so
+    // every entity any feature might want has to be declared before indexing.
     // The dashboard reports on entities the architectural ruleset does not cover
-    // (refuse capacity lives on IfcTank, which is MEP), so make sure they are
-    // indexed even when they carry no mapped requirements.
+    // (refuse capacity lives on IfcTank, which is MEP), and a check that has not
+    // been loaded yet still declares its entities in the registry manifest.
     for (const e of DASHBOARD_ENTITIES) ruleset.entities.add(e);
+    for (const e of registry.requiredEntities()) ruleset.entities.add(e);
+
+    // The element inspector reads live pass/fail from this module, so it is
+    // fetched at boot rather than on first run. It is small, and not awaiting it
+    // keeps it off the critical path. Every other check stays lazy.
+    registry.load('ifc-values').then(renderCheckMenu).catch((err) => {
+      console.error('The IFC values check could not be loaded:', err);
+    });
+
     el.badge.innerHTML =
       `IFC-SG <b>${ruleset.meta.requirements}</b> rules · <b>${ruleset.targets.length}</b> components`;
     el.badge.title =
@@ -193,6 +255,18 @@ function wireUI() {
   el.toolSpaces.addEventListener('click', () => setSpacesVisible(!spacesVisible));
   el.toolShowAll.addEventListener('click', showAll);
 
+  // The survey outlines are drawn by a check; the rail only clears them, so it
+  // does nothing until there is something to clear.
+  el.toolSurvey.addEventListener('click', () => {
+    if (!viewer.hasSurveyOverlays) {
+      toast('Run the geo-referencing check with a cadastral lot file to draw survey outlines.');
+      return;
+    }
+    viewer.clearSurveyOverlays();
+    el.toolSurvey.classList.remove('active');
+    el.toolSurvey.title = 'No survey outlines drawn';
+  });
+
   let wireframe = false;
   el.toolWireframe.addEventListener('click', () => {
     wireframe = !wireframe;
@@ -250,14 +324,21 @@ async function loadFiles(files) {
     return;
   }
 
+  // Warn before parsing: a parse cannot be interrupted, and a file that does
+  // not fit takes the whole tab down with it. The user can still go ahead.
+  const now = measure(viewer);
+  const forecast = project(now, ifcFiles);
+  if (forecast.level === LEVEL.DANGER) {
+    toast(`${formatBytes(forecast.fileBytes)} of IFC is expected to need about ` +
+      `${formatBytes(forecast.peak)} of memory against a ${formatBytes(now.budget)} budget. ` +
+      'The browser tab may run out of memory while loading.');
+  }
+
   el.dropzone.classList.remove('visible');
   el.loading.classList.add('visible');
 
   clearQuery();
-  checkResult = null;
-  el.summary.classList.remove('visible');
-  el.issues.innerHTML = '';
-  el.btnColourStatus.disabled = true;
+  clearCheckResults();
 
   let loaded = 0;
   for (const [i, file] of ifcFiles.entries()) {
@@ -280,6 +361,7 @@ async function loadFiles(files) {
       // Everything the mapping needs is now in the index, and nothing after this
       // reads the wasm model — so hand that memory back before the next file.
       viewer.releaseModelData(entry.modelID);
+      renderMemory();
       loaded++;
     } catch (err) {
       console.error(err);
@@ -316,13 +398,14 @@ function rebuildIndex() {
   el.filename.classList.toggle('has-file', names.length > 0);
   el.filename.title = names.join('\n');
   el.btnReset.disabled = !viewer.hasModels;
-  el.btnRunCheck.disabled = !index;
+  updateRunButton();
   el.btnDash.disabled = !index;
   if (!index) el.dash.classList.remove('visible');
 
   renderModels();
   renderTree();
   applyVisibility();
+  renderMemory();
 
   if (index && ![...counts.values()].some((n) => n > 0)) {
     toast('No IFC-SG mapped components found. The model may not use SGPset property sets.');
@@ -368,10 +451,7 @@ function removeModel(modelID) {
   indexes.delete(modelID);
   viewer.removeModel(modelID);
   clearQuery();
-  checkResult = null;
-  el.summary.classList.remove('visible');
-  el.issues.innerHTML = '';
-  el.btnColourStatus.disabled = true;
+  clearCheckResults();
   rebuildIndex();
   if (!viewer.hasModels) el.dropzone.classList.add('visible');
 }
@@ -651,37 +731,333 @@ function applyOverlay() {
   viewer.setQuery(groups, contextMode);
 }
 
-// ------------------------------------------------------------- compliance check
+// ------------------------------------------------------------- compliance checks
 
-function doRunCheck() {
-  if (!index || !ruleset) return;
-  const agency = el.fAgency.value;
-  const discipline = el.fDiscipline.value;
-
-  el.btnRunCheck.disabled = true;
-  el.btnRunCheck.textContent = 'Checking…';
-
-  setTimeout(() => {
-    try {
-      checkResult = runCheck(index, ruleset, (t) =>
-        (!agency || t.agency === agency) && (!discipline || t.discipline === discipline));
-      renderSummary();
-      renderIssues();
-      el.btnColourStatus.disabled = false;
-    } catch (err) {
-      console.error(err);
-      toast('The compliance check failed — see the browser console.');
-    } finally {
-      el.btnRunCheck.disabled = false;
-      el.btnRunCheck.textContent = 'Run compliance check';
+/**
+ * What a check module is allowed to do to the app.
+ *
+ * Modules render their own results but never touch the viewer, the legend or
+ * the globals above. Everything they want to happen goes through here, so there
+ * is one code path that colours the model no matter which check asked.
+ */
+const shellActions = {
+  showInModel(groups, title, subtitle = '') {
+    const usable = (groups || []).filter((g) => g.elements && g.elements.length);
+    if (!usable.length) {
+      toast('Those elements are not in the loaded models.');
+      return;
     }
-  }, 20);
+    legend = usable.map((g) => ({
+      label: g.label, colour: g.colour, elements: g.elements, missing: false,
+    }));
+    selection = null;
+    soloIndex = -1;
+    // Colouring spaces while spaces are hidden would paint nothing.
+    if (usable.some((g) => g.elements.some((e) => e.canonicalEntity === 'IFCSPACE')) && !spacesVisible) {
+      setSpacesVisible(true);
+    }
+    el.legendTitle.innerHTML = `${esc(title)}<small>${esc(subtitle)}</small>`;
+    renderLegend();
+    applyOverlay();
+    renderTree();
+  },
+  showElement(element) {
+    if (element) showElement(element);
+  },
+  toast(message) {
+    toast(message);
+  },
+  /**
+   * Draws survey polygons — a cadastral lot, a site boundary — on the ground
+   * plane. Rings arrive in projected metres, and the shell rebuilds the same
+   * transform the check used to place them in the scene.
+   */
+  showSurvey(overlays) {
+    if (!viewer || !index) return;
+    const transform = buildTransform(index.georef, viewer.coordinationMatrix);
+    if (!transform.ok) {
+      toast('The model is not georeferenced, so survey outlines cannot be placed.');
+      return;
+    }
+    const ground = viewer.groundLevel();
+    viewer.setSurveyOverlays((overlays || []).map((o) => ({
+      points: o.ring.map(([E, N]) => transform.svy21ToScene(E, N, 0)),
+      colour: o.colour,
+      opacity: 0.18,
+      elevation: ground,
+    })));
+    viewer.fitSurvey();
+    el.toolSurvey.classList.add('active');
+    el.toolSurvey.title = `Clear ${overlays.length} survey outline${overlays.length > 1 ? 's' : ''}`;
+  },
+};
+
+/** Drops the last run's results. Called whenever the model set changes. */
+function clearCheckResults() {
+  if (checkAbort) checkAbort.abort();
+  checkOutcomes = [];
+  el.summary.classList.remove('visible');
+  el.issues.innerHTML = '';
+  el.btnColourStatus.disabled = true;
+  // Survey outlines are placed against a particular model's datum, so they are
+  // meaningless once the model set changes.
+  if (viewer) {
+    viewer.clearSurveyOverlays();
+    el.toolSurvey.classList.remove('active');
+    el.toolSurvey.title = 'No survey outlines drawn';
+  }
+  if (el.checkMenu.children.length) renderCheckMenu();
 }
 
+/** Restores the previous selection, falling back to every non-experimental check. */
+function loadSelection() {
+  const ids = new Set(registry.all().filter((c) => !c.experimental).map((c) => c.id));
+  try {
+    const saved = JSON.parse(localStorage.getItem(SELECTION_KEY) || 'null');
+    if (Array.isArray(saved)) {
+      const known = saved.filter((id) => registry.byId(id));
+      // An empty saved list is a real choice; an unparseable one is not.
+      return new Set(known);
+    }
+  } catch { /* storage blocked or corrupt — fall back to the default */ }
+  return ids;
+}
+
+function saveSelection() {
+  try {
+    localStorage.setItem(SELECTION_KEY, JSON.stringify([...selectedChecks]));
+  } catch { /* private window or blocked storage; the session still works */ }
+}
+
+/** The menu of available checks, grouped by authority. */
+function renderCheckMenu() {
+  const groups = registry.byAuthority();
+
+  el.checkMenu.innerHTML = groups.map((group) => `
+    <div class="cm-group">
+      <div class="cm-head">${esc(group.authority)}</div>
+      ${group.checks.map((c) => {
+        const outcome = checkOutcomes.find((o) => o.id === c.id);
+        let chip = '';
+        if (outcome && outcome.error) {
+          chip = '<span class="cm-chip bad">failed</span>';
+        } else if (outcome && outcome.result) {
+          const s = outcome.result.summary;
+          chip = s.fail
+            ? `<span class="cm-chip bad">${s.fail} issue${s.fail > 1 ? 's' : ''}</span>`
+            // A check that asserted nothing has not found the model clean — it
+            // has not looked at it. Saying "clean" there would be a lie.
+            : s.assertions ? '<span class="cm-chip ok">clean</span>'
+              : '<span class="cm-chip">nothing checked</span>';
+        } else if (registry.stateOf(c.id) === 'loading') {
+          chip = '<span class="cm-chip">loading…</span>';
+        }
+        return `
+        <label class="cm-row" data-id="${esc(c.id)}">
+          <input type="checkbox"${selectedChecks.has(c.id) ? ' checked' : ''} />
+          <span class="cm-text">
+            <span class="cm-name">${esc(c.title)}
+              ${c.experimental ? '<span class="cm-tag">no rules yet</span>' : ''}
+              ${chip}
+            </span>
+            <small>${esc(c.summary)}</small>
+          </span>
+        </label>
+        ${selectedChecks.has(c.id) ? renderCheckInputs(c) : ''}`;
+      }).join('')}
+    </div>`).join('');
+
+  el.checkMenu.querySelectorAll('.cm-row > input[type=checkbox]').forEach((box) => {
+    box.addEventListener('change', () => {
+      const id = box.closest('.cm-row').dataset.id;
+      if (box.checked) selectedChecks.add(id);
+      else selectedChecks.delete(id);
+      saveSelection();
+      // Inputs appear and disappear with their check, so the menu is redrawn.
+      renderCheckMenu();
+    });
+  });
+
+  wireCheckInputs();
+  updateRunButton();
+}
+
+/** The extra inputs a check declares, shown only while that check is selected. */
+function renderCheckInputs(check) {
+  if (!check.inputs || !check.inputs.length) return '';
+
+  return `<div class="cm-inputs">${check.inputs.map((input) => {
+    const key = check.id + '.' + input.id;
+    const held = checkInputs.get(key);
+    let control;
+    if (input.kind === 'file') {
+      control = `<div class="cm-file">
+           <button class="btn sm" data-pick="${esc(key)}">Choose file</button>
+           <input type="file" data-file="${esc(key)}" accept="${esc(input.accept || '')}" hidden />
+           <span class="cm-filename">${held ? esc(held.name) : 'No file chosen'}</span>
+           ${held ? `<button class="btn sm" data-clear="${esc(key)}" title="Remove">&times;</button>` : ''}
+         </div>`;
+    } else if (input.kind === 'select') {
+      const current = held === undefined ? input.default : held;
+      control = `<select class="cm-select" data-select="${esc(key)}">${
+        (input.options || []).map((o) =>
+          `<option value="${esc(o.value)}"${o.value === current ? ' selected' : ''}>${esc(o.label)}</option>`
+        ).join('')}</select>`;
+    } else {
+      control = `<input type="text" class="cm-textin" data-text="${esc(key)}"
+           placeholder="${esc(input.placeholder || '')}" value="${esc(held || '')}" />`;
+    }
+
+    return `<div class="cm-input">
+      <div class="cm-input-label">${esc(input.label)}</div>
+      ${control}
+      ${input.help ? `<div class="cm-help">${esc(input.help)}</div>` : ''}
+    </div>`;
+  }).join('')}</div>`;
+}
+
+function wireCheckInputs() {
+  el.checkMenu.querySelectorAll('[data-pick]').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      el.checkMenu.querySelector(`[data-file="${CSS.escape(btn.dataset.pick)}"]`).click();
+    });
+  });
+
+  el.checkMenu.querySelectorAll('[data-file]').forEach((picker) => {
+    picker.addEventListener('change', async (e) => {
+      const file = e.target.files && e.target.files[0];
+      if (!file) return;
+      try {
+        // Read once, here, so the check receives plain text and never touches
+        // the file system itself.
+        checkInputs.set(picker.dataset.file, { name: file.name, text: await file.text() });
+        renderCheckMenu();
+      } catch (err) {
+        console.error(err);
+        toast(`Could not read ${file.name}.`);
+      }
+      e.target.value = '';
+    });
+  });
+
+  el.checkMenu.querySelectorAll('[data-clear]').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      checkInputs.delete(btn.dataset.clear);
+      renderCheckMenu();
+    });
+  });
+
+  el.checkMenu.querySelectorAll('[data-text]').forEach((box) => {
+    box.addEventListener('click', (e) => e.stopPropagation());
+    box.addEventListener('input', () => {
+      const v = box.value.trim();
+      if (v) checkInputs.set(box.dataset.text, v);
+      else checkInputs.delete(box.dataset.text);
+    });
+  });
+
+  el.checkMenu.querySelectorAll('[data-select]').forEach((box) => {
+    box.addEventListener('click', (e) => e.stopPropagation());
+    box.addEventListener('change', (e) => {
+      e.stopPropagation();
+      checkInputs.set(box.dataset.select, box.value);
+    });
+  });
+}
+
+/** Everything the user has supplied for one check, keyed by input id. */
+function inputsFor(checkId) {
+  const meta = registry.byId(checkId);
+  const out = {};
+  for (const input of (meta && meta.inputs) || []) {
+    const held = checkInputs.get(checkId + '.' + input.id);
+    // A select the user never touched still has the value the menu is showing.
+    if (held !== undefined) out[input.id] = held;
+    else if (input.default !== undefined) out[input.id] = input.default;
+  }
+  return out;
+}
+
+function updateRunButton() {
+  const n = selectedChecks.size;
+  el.btnRunCheck.disabled = !index || n === 0 || checkRunning;
+  el.btnRunCheck.textContent = checkRunning
+    ? 'Checking…'
+    : n === 0 ? 'Select a check'
+      : n === 1 ? 'Run 1 check' : `Run ${n} checks`;
+}
+
+/** Runs every selected check, in menu order. */
+async function doRunCheck() {
+  if (!index || !ruleset || !selectedChecks.size || checkRunning) return;
+
+  const agency = el.fAgency.value;
+  const discipline = el.fDiscipline.value;
+  const ids = registry.all().map((c) => c.id).filter((id) => selectedChecks.has(id));
+
+  if (checkAbort) checkAbort.abort();
+  checkAbort = new AbortController();
+
+  checkRunning = true;
+  updateRunButton();
+  el.issues.innerHTML = '<div class="empty-note">Running…</div>';
+
+  const ctx = {
+    index,
+    ruleset,
+    modelNames: new Map(viewer.entries.map((e) => [e.modelID, e.name])),
+    filter: (t) => (!agency || t.agency === agency) && (!discipline || t.discipline === discipline),
+    signal: checkAbort.signal,
+    progress: () => {},
+    inputsFor,
+    // The submitted files themselves, for the checks that are about the
+    // submission rather than about the building.
+    files: viewer.entries.map((e) => ({ modelID: e.modelID, name: e.name, bytes: e.bytes })),
+    // Where the model sits, and what it is made of — needed by checks that ask
+    // about position rather than properties.
+    coordinationMatrix: viewer.coordinationMatrix,
+    geometry: {
+      // Hulls rather than raw points: the affine transform to survey
+      // coordinates preserves convexity, so hulling in scene space first is
+      // both exact and far cheaper than transforming millions of vertices.
+      elementHull: (elements) => viewer.elementHull(elements),
+      modelHull: () => viewer.modelHull(),
+      groundLevel: () => viewer.groundLevel(),
+    },
+  };
+
+  try {
+    checkOutcomes = await runChecks(ids, ctx, (msg) => {
+      el.issues.innerHTML = `<div class="empty-note">${esc(msg)}</div>`;
+    });
+    renderSummary();
+    renderCheckResults();
+    renderCheckMenu();
+    el.btnColourStatus.disabled = !checkOutcomes.some((o) => o.result);
+
+    const broken = checkOutcomes.filter((o) => o.error);
+    if (broken.length) {
+      toast(`${broken.length} check${broken.length > 1 ? 's' : ''} could not run — see the browser console.`);
+    }
+  } catch (err) {
+    console.error(err);
+    toast('The compliance check failed — see the browser console.');
+  } finally {
+    checkRunning = false;
+    updateRunButton();
+  }
+}
+
+/** Headline numbers across every check that ran. */
 function renderSummary() {
-  const t = checkResult.totals;
-  const pct = t.checks ? Math.round((t.pass / t.checks) * 100) : 0;
+  const t = totalsOf(checkOutcomes);
+  const pct = t.assertions ? Math.round((t.pass / t.assertions) * 100) : 0;
   const scope = [el.fAgency.value, el.fDiscipline.value].filter(Boolean).join(' · ') || 'All agencies';
+  const names = checkOutcomes.filter((o) => o.result).map((o) => o.meta.title).join(', ');
 
   el.summary.classList.add('visible');
   el.summary.innerHTML = `
@@ -690,113 +1066,126 @@ function renderSummary() {
       <i style="width:${100 - pct}%;background:var(--danger)"></i>
     </div>
     <div class="sgrid">
+      <span class="k">Checks run</span><span class="v">${esc(names || 'none')}</span>
       <span class="k">Scope</span><span class="v">${esc(scope)}</span>
       <span class="k">Models</span><span class="v">${viewer.entries.length}</span>
       <span class="k">Elements checked</span><span class="v">${t.elements}</span>
-      <span class="k">Property checks</span><span class="v">${t.checks}</span>
+      <span class="k">Assertions</span><span class="v">${t.assertions}</span>
       <span class="k">Compliant</span><span class="v" style="color:var(--ok)">${t.pass} (${pct}%)</span>
       <span class="k">Issues</span><span class="v" style="color:var(--danger)">${t.fail}</span>
     </div>`;
 }
 
-function renderIssues() {
-  const failing = checkResult.targets.filter((r) => r.fail > 0);
-  if (!failing.length) {
-    el.issues.innerHTML = `<div class="empty-note">${
-      checkResult.totals.checks
-        ? 'Every mapped element satisfies its IFC-SG requirements in this scope.'
-        : 'No mapped components found in this model for this scope.'
-    }</div>`;
+/**
+ * One section per check. The module renders its own body, so the shell never
+ * needs to understand what any particular check found.
+ */
+function renderCheckResults() {
+  el.issues.innerHTML = '';
+
+  if (!checkOutcomes.length) {
+    el.issues.innerHTML = '<div class="empty-note">No checks were run.</div>';
     return;
   }
 
-  el.issues.innerHTML = failing.map((r, ri) => {
-    // Roll the per-element issues up to one line per requirement + status.
-    const byReq = new Map();
-    for (const iss of r.issues) {
-      const k = iss.req.pset + '.' + iss.req.prop + '|' + iss.status;
-      if (!byReq.has(k)) byReq.set(k, { req: iss.req, status: iss.status, n: 0 });
-      byReq.get(k).n++;
-    }
-    const rows = [...byReq.values()].sort((a, b) => b.n - a.n);
-    return `
-      <div class="issue-target" data-i="${ri}">
-        <div class="issue-head">
-          <span class="iname">${esc(r.target.component)}
-            <small>${esc(r.target.agency)} · ${esc(r.target.entity)} · ${r.elements.length} elements</small>
-          </span>
-          <span class="pill bad">${r.fail}</span>
-        </div>
-        <div class="issue-body"><div class="ilist">
-          ${rows.map((x) => `
-            <div class="irow">
-              <span class="status-dot" style="background:${hex(STATUS_COLOUR[x.status])}"></span>
-              <span class="ik">${esc(x.req.prop)}<br><span style="color:var(--text-dim);font-size:10.5px">
-                ${esc(x.req.pset)} — ${esc(STATUS_LABEL[x.status])}</span></span>
-              <span class="iv">${x.n}</span>
-            </div>`).join('')}
-        </div></div>
-      </div>`;
-  }).join('');
+  for (const outcome of checkOutcomes) {
+    const section = document.createElement('div');
+    section.className = 'check-result';
 
-  el.issues.querySelectorAll('.issue-target').forEach((node) => {
-    const r = failing[+node.dataset.i];
-    node.querySelector('.issue-head').addEventListener('click', () => {
-      node.classList.toggle('open');
-      // Show the offending elements in the model alongside the numbers.
-      const bad = new Set(r.issues.map((i) => i.element.key));
-      legend = [
-        { label: `${r.target.component} — issues`, colour: STATUS_COLOUR[STATUS.MISSING_PROP],
-          elements: r.elements.filter((e) => bad.has(e.key)), missing: false },
-        { label: `${r.target.component} — compliant`, colour: STATUS_COLOUR[STATUS.PASS],
-          elements: r.elements.filter((e) => !bad.has(e.key)), missing: false },
-      ].filter((g) => g.elements.length);
-      selection = { target: r.target, req: null };
-      soloIndex = -1;
-      if (r.target.canonicalEntity === 'IFCSPACE' && !spacesVisible) setSpacesVisible(true);
-      el.legendTitle.innerHTML =
-        `${esc(r.target.component)}<small>check result · ${r.elements.length} elements</small>`;
-      renderLegend();
-      applyOverlay();
-    });
-  });
+    const summary = outcome.result ? outcome.result.summary : null;
+    const pill = outcome.error
+      ? '<span class="pill bad">error</span>'
+      : summary && summary.fail ? `<span class="pill bad">${summary.fail}</span>`
+        // "Nothing checked" is not "clean": a check with no rules, or one whose
+        // rules all fell out of scope, asserted nothing about this model.
+        : summary && summary.assertions ? '<span class="pill ok">clean</span>'
+          : '<span class="pill">nothing checked</span>';
+
+    section.innerHTML = `
+      <div class="cr-head">
+        <span class="cr-title">${esc(outcome.meta.title)}
+          <small>${esc(outcome.meta.authority)} · ${Math.round(outcome.ms)} ms</small>
+        </span>${pill}
+      </div>
+      ${outcome.result && outcome.result.note
+        ? `<div class="cr-note">${esc(outcome.result.note)}</div>` : ''}
+      <div class="cr-body"></div>`;
+
+    const body = section.querySelector('.cr-body');
+
+    if (outcome.error) {
+      body.innerHTML =
+        `<div class="empty-note">This check could not run.<br><code>${esc(outcome.error.message)}</code></div>`;
+    } else {
+      const module = registry.peek ? registry.peek(outcome.id) : null;
+      const renderer = module && typeof module.render === 'function' ? module.render : null;
+      if (renderer) renderer(outcome.result, body, shellActions);
+      else renderGenericFindings(outcome.result, body);
+    }
+
+    el.issues.appendChild(section);
+  }
 }
 
-/** Colours every checked element by its worst status across all its requirements. */
-function colourByStatus() {
-  if (!checkResult) return;
-  const worst = new Map();   // element key -> status
-  const order = [STATUS.PASS, STATUS.INVALID_TYPE, STATUS.INVALID_VALUE,
-    STATUS.EMPTY, STATUS.MISSING_PROP, STATUS.MISSING_PSET];
+/** Fallback results view for a module that does not render its own. */
+function renderGenericFindings(result, host) {
+  const findings = result.findings || [];
+  if (!findings.length) {
+    host.innerHTML = '<div class="empty-note">Nothing to report.</div>';
+    return;
+  }
+  host.innerHTML = '<div class="ilist">' + findings.slice(0, 300).map((f) => `
+    <div class="irow">
+      <span class="status-dot" style="background:${hex(SEVERITY_COLOUR[f.severity] || SEVERITY_COLOUR.fail)}"></span>
+      <span class="ik">${esc(f.label || f.code)}<br>
+        <span style="color:var(--text-dim);font-size:10.5px">${esc(f.message || '')}</span></span>
+    </div>`).join('') + '</div>';
+}
 
-  for (const r of checkResult.targets) {
-    for (const e of r.elements) if (!worst.has(e.key)) worst.set(e.key, STATUS.PASS);
-    for (const iss of r.issues) {
-      const cur = worst.get(iss.element.key);
-      if (order.indexOf(iss.status) > order.indexOf(cur)) worst.set(iss.element.key, iss.status);
+/**
+ * Colours every checked element by its worst severity across every check that
+ * ran, so one view answers "where are the problems" regardless of which check
+ * found them.
+ */
+function colourByStatus() {
+  if (!checkOutcomes.length) return;
+
+  const worst = new Map();   // element key -> severity
+
+  for (const outcome of checkOutcomes) {
+    if (!outcome.result) continue;
+    for (const key of outcome.result.summary.elementKeys || []) {
+      if (!worst.has(key)) worst.set(key, SEVERITY.PASS);
     }
+    for (const f of outcome.result.findings || []) {
+      if (!f.element) continue;
+      const current = worst.get(f.element.key) || SEVERITY.PASS;
+      worst.set(f.element.key, worstOf([current, f.severity]));
+    }
+  }
+
+  if (!worst.size) {
+    toast('No elements were checked, so there is nothing to colour.');
+    return;
   }
 
   const buckets = new Map();
-  for (const [key, status] of worst) {
-    if (!buckets.has(status)) buckets.set(status, []);
-    buckets.get(status).push(index.byId.get(key));
+  for (const [key, severity] of worst) {
+    if (!buckets.has(severity)) buckets.set(severity, []);
+    const element = index.byId.get(key);
+    if (element) buckets.get(severity).push(element);
   }
 
-  legend = order
-    .filter((s) => buckets.has(s))
+  const groups = SEVERITY_ORDER
+    .filter((s) => buckets.has(s) && buckets.get(s).length)
     .map((s) => ({
-      label: STATUS_LABEL[s], colour: STATUS_COLOUR[s],
-      elements: buckets.get(s).filter(Boolean), missing: false,
+      label: SEVERITY_LABEL[s],
+      colour: SEVERITY_COLOUR[s],
+      elements: buckets.get(s),
     }));
 
-  selection = null;
-  soloIndex = -1;
-  el.legendTitle.innerHTML =
-    `Compliance status<small>${worst.size} elements across all checked components</small>`;
-  renderLegend();
-  applyOverlay();
-  renderTree();
+  shellActions.showInModel(groups, 'Compliance status',
+    `${worst.size} elements across ${checkOutcomes.filter((o) => o.result).length} checks`);
 }
 
 // ----------------------------------------------------------------- dashboard
@@ -993,33 +1382,46 @@ function showElement(item) {
   html += rows.map(([k, v]) =>
     `<div class="prop-row"><span class="k">${esc(k)}</span><span class="v">${esc(v)}</span></div>`).join('');
 
-  // IFC-SG requirements that apply to this element, with live pass/fail.
-  const applicable = ruleset
-    ? ruleset.targets.filter((t) => matchesTarget(item, t) && t.requirements.length)
-    : [];
+  // Live pass/fail from every loaded check that can explain one element. This is
+  // evaluated on demand, so it is correct whether or not a check has been run,
+  // and a check the user has never loaded simply contributes nothing.
+  if (ruleset) {
+    const ctx = { index, ruleset, modelNames: new Map(), filter: () => true };
 
-  if (applicable.length) {
-    html += `<div class="sec-head">IFC-SG REQUIREMENTS</div>`;
-    for (const t of applicable) {
-      html += `<div class="pset-name">${esc(t.agency)} · ${esc(t.component)}</div>`;
-      for (const req of t.requirements) {
-        const r = evaluate(item, req, ruleset);
-        const colour = hex(STATUS_COLOUR[r.status]);
-        const shown = isEmptyValue(r.value) ? '—' : formatValue(r.value);
+    for (const { meta, module } of registry.loadedModules()) {
+      if (typeof module.explain !== 'function') continue;
+
+      let findings = [];
+      try {
+        findings = module.explain(item, ctx) || [];
+      } catch (err) {
+        console.error(`The ${meta.title} check could not explain this element:`, err);
+        continue;
+      }
+
+      html += `<div class="sec-head">${esc(meta.title.toUpperCase())}</div>`;
+      if (!findings.length) {
+        html += `<div style="color:var(--text-dim);font-size:12px">
+                   No requirements for this entity and subtype.</div>`;
+        continue;
+      }
+
+      let rule = null;
+      for (const f of findings) {
+        if (f.rule && f.rule !== rule) {
+          rule = f.rule;
+          html += `<div class="pset-name">${esc(rule)}</div>`;
+        }
+        const colour = hex(f.colour !== undefined ? f.colour : SEVERITY_COLOUR[f.severity]);
+        const detail = f.severity === SEVERITY.PASS ? '' : ' — ' + esc(f.label);
         html += `
           <div class="chk-row">
-            <span class="status-dot" style="background:${colour}" title="${esc(STATUS_LABEL[r.status])}"></span>
-            <span class="ck">${esc(req.prop)}
-              <small>${esc(req.pset)}${r.status === STATUS.PASS ? '' : ' — ' + esc(STATUS_LABEL[r.status])}</small>
-            </span>
-            <span class="cv">${esc(shown)}</span>
+            <span class="status-dot" style="background:${colour}" title="${esc(f.label)}"></span>
+            <span class="ck">${esc(f.message || f.label)}<small>${detail}</small></span>
+            <span class="cv">${esc(f.value === undefined ? '' : f.value)}</span>
           </div>`;
       }
     }
-  } else {
-    html += `<div class="sec-head">IFC-SG REQUIREMENTS</div>
-             <div style="color:var(--text-dim);font-size:12px">
-               No mapped requirements for this entity and subtype.</div>`;
   }
 
   // Everything actually present on the element, for cross-checking.

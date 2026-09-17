@@ -120,7 +120,31 @@ Filters narrow the list by agency, by discipline, or by free text, and
 The tool rail toggles how the un-selected remainder is drawn — ghosted, hidden,
 or normal.
 
-### Compliance check (Compliance tab)
+### Compliance checks (Compliance tab)
+
+The tab opens on a **menu of available checks, grouped by authority**. Tick the
+ones to run and press the run button; the selection is remembered between
+sessions. Each check reports into its own section, and the summary at the top
+totals them together.
+
+| Check | What it asks |
+| --- | --- |
+| IFC values | Does the model carry the data the CORENET X mapping requires? |
+| Geo-referencing | Is the model in the right place on the ground? |
+| URA requirements | GFA parameters, sanity rules, required elements, submission limits |
+| BCA requirements | Do the BCA building rules hold? *(no rules defined yet)* |
+
+The distinction between the first and the others is the important one. **IFC
+values is a data check** — it validates that properties are present, populated
+and within their accepted values. **The authority checks are building checks** —
+they read those values and test them against what the agency publishes. A model
+can pass the first and fail the second.
+
+BCA is wired up and runs, but carries no rules yet, so it reports nothing. Its
+rules are deliberately absent rather than guessed: a plausible-looking rule that
+is wrong reads as an authoritative result.
+
+#### The IFC values check
 
 Runs every mapped requirement against every matching element and reports:
 
@@ -140,6 +164,208 @@ results colours its compliant and non-compliant elements against each other.
 Clicking any element opens an inspector showing its identity, every applicable
 IFC-SG requirement with live pass/fail, and every property set actually present —
 so a flagged value can be checked against what the model really contains.
+
+### URA requirements
+
+Reverse-engineered from the URA Revit Model Quality Checker Plugin user guide,
+section 7. **Twenty rules**, each citing the guide section it came from.
+
+Select the **submission gateway** first. URA runs two, and they differ
+substantially: the Design Gateway asks for far less than the Construction
+Gateway. Rules belonging to the other gateway are not run and not reported —
+an unasked rule is not the same as an unanswered one. The selector defaults to
+Construction, because a forgotten selection should over-report rather than
+quietly skip requirements.
+
+| Guide | Rules | What they check |
+| --- | --- | --- |
+| 7.3 | 6 | Core parameters populated. Thresholds are the main gateway difference: the Design Gateway wants at least one `AGF_Name` and one `ALS_LandscapeType`; the Construction Gateway wants 50% `AGF_Name`, 50% `AGF_DevelopmentUse`, 20% `AVF_IncludeAsGFA`. |
+| 7.5 | 6 | The sanity rules. Private strata counts as GFA, bonus GFA counts as GFA, GFA areas declare a use, dwelling units exist and carry unit numbers. |
+| 7.7 | 3 | Area_GFA objects, a site boundary and Existing terrain are present. |
+| 7.8 | 2 | Every file within 800 MB, and level names consistent with the lowest level under 100 m (100000 mm). |
+| 7.9 | 3 | Export settings, read back from the file. |
+
+Three things about how this differs from the Revit original.
+
+**Some checks could not come across, and were dropped rather than faked.** The
+active view being a 3D view, the mapping file's format, elements hidden in a
+view, and every "wrong Revit family category" clause are all properties of a
+Revit session that an exported IFC does not record. Guide section 7.2 was
+dropped for a subtler reason: its point is that the Revit template *declares*
+every parameter even when unused, but Revit omits empty parameters on export, so
+"declared but blank" and "never declared" are indistinguishable downstream.
+
+**Section 7.9 was reinterpreted rather than transcribed.** The guide checks
+Revit's export dialogue, which is gone by the time an IFC exists. Instead these
+read the fingerprints those settings leave behind: whether common property sets
+are present, whether base quantities are present, and whether the model exports
+to a single `IfcSite`. That last one is worth having — a test file here carries
+three, one of them a scupper drain mapped to `IfcSite` by mistake.
+
+**Lengths are reported in millimetres**, normalised from whatever unit each file
+was authored in, and rounded to three decimals. Both halves matter. Normalising
+means a federated set that mixes units is judged on height rather than on raw
+numbers, and it is why the 100 m ceiling is applied as 100000 mm — comparing a
+millimetre model against 100 would fail it at ground level. Rounding removes
+exporter noise: a level drawn at −500 is written as −499.9999999999913, and two
+levels differing only in that tail would otherwise read as inconsistent.
+
+Level elevations are also resolved through the placement chain to one datum
+rather than read from the `Elevation` attribute, which is relative to whatever
+contains the storey. On the test file that is the difference between a declared
+−500 and an absolute 13500, and it is what exposes two storeys sharing a name
+200 mm apart.
+
+**Vocabulary (7.4) is not checked here.** Those four parameters are already
+validated by the IFC values check against the mapping workbook. Checking them
+twice would give one element two verdicts from one run. Instead URA's list is
+merged into the workbook's, which matters because **the two published sources
+disagree**:
+
+| Parameter | Difference |
+| --- | --- |
+| `AGF_DevelopmentUse` | None; 25 values identical |
+| `AGF_BuildingTypology` | The workbook carries 16 values the guide omits, including Data Centre and Polyclinic |
+| `AGF_BonusGFAType` | The guide has `Utility GFA for DCS/CCS networks`; the workbook does not |
+| `AST_AreaType` | The guide says `Communal Area`, the workbook says `Common Area` |
+
+`data/ifcsg-rules.json` is generated and must not be hand-edited, so the values
+URA accepts and the workbook lacks live in `data/ura-vocabulary.json` and are
+merged at load. Both `AST_AreaType` spellings are accepted rather than guessing
+which one a reviewer applies.
+
+### Geo-referencing (URA)
+
+Modelled on the URA Revit Model Quality Checker's geo-referencing check. It
+answers one narrow question: **is this model in the right place on the ground?**
+Not whether the building complies with anything — whether the coordinates it was
+authored against put it inside the land it is supposed to occupy.
+
+Select the check and a file picker appears for the **cadastral lot GeoJSON**.
+Get it from URA's site-information service: search the MK lot number, then
+*Download Cadastral Lot(s)* and *Download in GeoJSON format*. One file per run,
+so a development spanning several lots needs them all in the one file. There is
+also a fallback for a lot that is not in the cadastral database: three surveyed
+vertices in SVY21, checked against the site boundary to ±20 mm.
+
+It reports:
+
+| Assertion | Meaning |
+| --- | --- |
+| Model is georeferenced | An `IfcMapConversion` exists. Without it nothing else can be checked. |
+| Coordinate system is SVY21 | The CRS is EPSG:3414. Anything else will not line up. |
+| Site boundary is modelled | An `IfcGeographicElement` with ObjectType `SITEBOUNDARY`, as the URA plugin looks for. |
+| Model sits within the SVY21 extent | Catches a model left at the origin or georeferenced into the sea. |
+| All files share the same coordinate reference | URA's shared-coordinates requirement, as it applies to a federated set. |
+| Model lies within the cadastral lot | Every footprint vertex falls inside the lot. |
+| Site boundary follows the lot line | Where a boundary is modelled, how far it departs from the cadastral line. |
+| IfcSite latitude and longitude agree | Cross-checks the site's declared position against the map conversion. |
+
+**Show on model** draws the cadastral lot in green and the site boundary in
+blue, on the ground plane, as the URA plugin does. The tool rail clears them.
+
+Three things are worth knowing about how it works.
+
+**The scale trap.** `IfcMapConversion.Scale` converts project units to map
+units, so a Revit export in millimetres onto a metre-based CRS carries 0.001.
+But web-ifc has already converted the geometry to metres, so applying that scale
+again shrinks the model by a thousand and it lands silently in the wrong place.
+The effective scale is `Scale / metresPerUnit`, which for that common case is
+exactly 1. The axis swap is the other trap: web-ifc hands three.js a Y-up scene
+where `scene = (x, z, -y)`, and losing the sign on that mirrors the model about
+north.
+
+**Containment is tested on the footprint hull, never the bounding box.** A
+bounding-box corner is not a point of the model. On the test model two of four
+box corners fall outside the lot while all ten real footprint vertices are
+inside, clearing the boundary by 0.73 m. The hull is also computed *exactly*
+rather than from sampled vertices: the hull of a sample is contained by the true
+hull, so sampling can miss a corner poking over a boundary. Exactness is
+affordable because eight extreme points form an octagon that is provably inside
+the hull, and everything within it is discarded in one linear pass before
+anything is sorted.
+
+**Where no site boundary is modelled**, containment falls back to the extent of
+the model geometry, and the report says so. A convex extent overstates a concave
+footprint, which makes that fallback conservative rather than lenient.
+
+The SVY21 projection is checked against published control values: the projection
+origin reproduces the false easting and northing exactly, a forward-and-back
+round trip over the whole island is accurate to 0.21 mm, and the projected area
+of the test lot matches the area URA's own file declares to five decimal places.
+
+## Adding a check
+
+Checks are modules under `js/checks/`. The framework exists so that a new
+authority is a new folder plus one line in the registry, and touches nothing
+else.
+
+### How it fits together
+
+```
+js/checks/registry.js     what checks exist; static metadata + dynamic import
+js/checks/runner.js       runs a selection, one at a time, with progress
+js/checks/severity.js     the one vocabulary every module shares
+js/checks/types.js        the module contract, as documentation
+js/checks/authority-kit.js   turns a list of rules into a working check
+js/checks/<id>/index.js   a check module
+js/checks/<id>/rules.js   its rules, where it is rule-driven
+```
+
+A check that needs something from the user — a cadastral lot file, a set of
+surveyed coordinates — declares it as an `inputs` entry in the manifest. The
+menu renders the control under that check when it is selected, reads a file to
+text before the check ever sees it, and hands the values over as `ctx.inputs`.
+A check that needs mesh vertices declares `needsGeometry` and receives
+`ctx.geometry`; that is the one part of the context which is not plain data, and
+therefore the one thing keeping such a check on the main thread.
+
+**Metadata is static, implementation is lazy.** The registry manifest is always
+in memory, so the menu renders and the model indexer knows which IFC entities to
+collect without downloading a single check. The module itself is fetched the
+first time its check actually runs — a session that never runs the URA check
+never loads it. The IFC values module is the one exception: the element
+inspector reads live pass/fail from it, so it is fetched at boot.
+
+That split matters more than it looks. The model is walked **once** at load and
+the parsed IFC is released immediately afterwards, so an entity a check needs
+must be declared before indexing. Declaring it in the manifest rather than in
+the module is what makes loading the module late safe.
+
+### The contract
+
+A module exports `run`, and optionally `render` and `explain`. The full shape is
+documented in `js/checks/types.js`. Three rules keep it working:
+
+- **`run` is pure** — index in, findings out, no DOM and no viewer. That is what
+  lets a check be tested against a fixture index and, later, moved into a Worker.
+- **The shell owns the 3D view.** A module never colours or hides anything; it
+  asks through `actions.showInModel`, and one code path does the work.
+- **Findings carry a shared `severity` and a module-specific `code`.** Severity
+  answers "how bad" so the shell can count and colour findings from a module it
+  knows nothing about; the code answers "what" for display.
+
+### A rule-driven authority check
+
+URA and BCA are built from `createAuthorityCheck`, which takes a list of rules
+and supplies all the iteration, counting and rendering. Adding a rule is an edit
+to an array — there is no control flow to get wrong:
+
+```js
+{
+  id: 'ura-gfa-use-declared',
+  title: 'Every GFA space declares its development use',
+  reference: 'URA — development control, use classification',
+  severity: SEVERITY.FAIL,
+  applies: (ctx) => ...,              // optional: is the rule in scope at all?
+  select: (ctx) => [...elements],     // what it applies to
+  assert: (el, ctx) => true | 'why it failed',
+}
+```
+
+A rule whose `applies` returns false is reported as **not evaluated**, which is
+deliberately not the same as passed. For rules about totals rather than
+elements, a rule may supply `evaluate(ctx)` and return findings directly.
 
 ## Regenerating the ruleset
 
@@ -216,10 +442,18 @@ in context.
 index.html                  shell, styles, panel markup
 js/viewer.js                three.js scene, multi-model loading, visibility, overlays
 js/ifc-index.js             walks each IFC once into a queryable element index
-js/ifcsg.js                 ruleset indexing, element matching, compliance rules
+js/ifcsg.js                 ruleset indexing, element matching, value evaluation
 js/dashboard.js             project quantity metrics, totalled by file and level
-js/app.js                   UI wiring: models, presets, legend, check, dashboard
+js/memory.js                tab memory estimate, budget and pre-load forecast
+js/util/dom.js              escaping and colour helpers shared with check modules
+js/geo/svy21.js             WGS84 <-> SVY21 (EPSG:3414) projection
+js/geo/polygon.js           rings: area, containment, distance, convex hull
+js/geo/geojson.js           reads URA cadastral lot exports
+js/geo/georef.js            scene <-> survey coordinates, via the map conversion
+js/checks/                  the check framework and the checks themselves
+js/app.js                   UI wiring: models, presets, legend, checks, dashboard
 data/ifcsg-rules.json       generated ruleset (do not edit)
+data/ura-vocabulary.json    values URA accepts that the workbook lacks (hand-maintained)
 tools/build-ifcsg-rules.ps1 workbook -> ruleset
 tools/serve.ps1             local static server
 ```
@@ -254,3 +488,33 @@ The remaining levers are upstream: 31 million vertices for one building is a
 heavy export, and no viewer-side change beats reducing that. Note also that
 closing a model frees heap for reuse but never returns it to the OS, so only a
 page reload truly resets a session.
+
+### Memory meter
+
+The top bar shows an estimate of the tab's memory against a budget, so an
+oversized model is visible before the tab crashes rather than after. Browsers
+report almost nothing useful here: `performance.memory` covers only the
+JavaScript heap, and a model's memory lives outside it in typed arrays and the
+wasm heap. So the meter adds up what the app allocates itself:
+
+| Part | How it is measured |
+| --- | --- |
+| Geometry buffers | every vertex and index buffer held by three.js, counting attributes shared between a model and its overlays once, plus the per-model index cache |
+| wasm heap | the web-ifc heap, which grows to fit the largest file parsed and never shrinks |
+| JavaScript heap | `performance.memory.usedJSHeapSize` where the browser provides it (Chromium) |
+
+GPU driver copies are not included; they live in another process, and it is the
+renderer process that runs out.
+
+The ceiling is a **budget, not a measured limit** — there is no API for the
+real one. It defaults to 4 GiB, which is where a 64-bit Chromium tab holding
+large typed arrays becomes unstable in practice, and is halved on machines that
+report less than 8 GB of RAM. Override it per session with `?membudget=6` (GiB)
+in the URL. The meter turns amber at 60% and red at 85%, with a one-off toast on
+entering the red band.
+
+Before a file is parsed, the expected footprint is projected from its size
+using the ratios measured above (about 10x the IFC size resident, 12x at peak).
+A projection past the budget produces a warning toast but does not block the
+load — the parse cannot be interrupted once started, so the point is to give the
+user the chance to close something first.
