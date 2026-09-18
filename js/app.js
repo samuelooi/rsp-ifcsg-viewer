@@ -78,8 +78,7 @@ let checkRunning = false;
 /** Aborts an in-flight run when the model changes or a new run starts. */
 let checkAbort = null;
 
-let sectionArmed = false;  // click-drag on the canvas draws a new section plane
-let sectionDragStart = null;
+let sectionArmed = false;  // a click on a model face places a new section cut
 let planActive = null;     // { name, y } while a plan view is showing
 
 // Query-tree hierarchy filters, macro to micro: Gateway narrows Authority
@@ -393,31 +392,47 @@ function setSectionArmed(on) {
   sectionArmed = on;
   el.toolSection.classList.toggle('active', on);
   el.toolSection.title = on
-    ? 'Drawing section cuts — click-drag across the model, click the tool again to stop'
-    : 'Section cut: click-drag a line across the model (like Forma)';
+    ? 'Placing section cuts — click a face to cut along it, drag a cut to slide it, click the tool again to stop'
+    : 'Section cut: click a face of the model (like Forma)';
   viewer.renderer.domElement.style.cursor = on ? 'crosshair' : '';
 }
 
+/**
+ * Forma's section tool: a click on a face places a cut through it, snapped to
+ * the nearest world axis; dragging an existing cut's handle slides it along
+ * that axis. Anything else while armed still orbits and pans as usual, so the
+ * camera can be moved between cuts without leaving the tool.
+ */
 function wireSectionTool() {
   el.toolSection.addEventListener('click', () => setSectionArmed(!sectionArmed));
 
   const canvas = viewer.renderer.domElement;
+  let press = null; // where the left button went down, to tell a click from a drag
+  // Capture phase, so this runs before OrbitControls' own pointerdown: a grab
+  // on a handle is swallowed here and the camera never starts a gesture.
   canvas.addEventListener('pointerdown', (e) => {
     if (!sectionArmed || e.button !== 0) return;
-    const p = viewer.raycastGround(e);
-    if (!p) return;
-    sectionDragStart = p;
-    viewer.setOrbitEnabled(false);
-    e.preventDefault();
+    press = { x: e.clientX, y: e.clientY };
+    if (viewer.grabSection(e) != null) e.stopImmediatePropagation();
+  }, { capture: true });
+  window.addEventListener('pointermove', (e) => {
+    if (viewer.sectionDragging) viewer.dragSection(e);
   });
   window.addEventListener('pointerup', (e) => {
-    if (!sectionDragStart) return;
-    const a = sectionDragStart;
-    sectionDragStart = null;
-    viewer.setOrbitEnabled(true);
-    const b = viewer.raycastGround(e);
-    if (!b || a.distanceTo(b) < 0.3) return; // too short to be an intentional cut
-    const id = viewer.addSectionPlane(a, b, viewer.activeCamera.position);
+    if (!press) return;
+    const moved = Math.hypot(e.clientX - press.x, e.clientY - press.y) > 5;
+    press = null;
+    if (viewer.sectionDragging) {
+      viewer.endSectionDrag();
+      return;
+    }
+    if (moved || !sectionArmed) return; // an orbit, not a placement
+    const face = viewer.raycastFace(e);
+    if (!face) {
+      toast('Click a face of the model to place a section cut.');
+      return;
+    }
+    const id = viewer.addSectionAtFace(face, viewer.activeCamera.position);
     if (id != null) renderSectionsBar();
   });
 }
@@ -435,7 +450,7 @@ function renderSectionsBar() {
       <button data-act="clear">Clear all</button></div>
     ${list.map((s, i) => `
       <div class="sb-row" data-id="${s.id}">
-        <span class="lbl">Section ${i + 1}</span>
+        <span class="lbl">Section ${i + 1} <small>${s.axis.toUpperCase()} axis</small></span>
         <button data-act="flip" title="Flip cut side">&#8644;</button>
         <button data-act="remove" title="Remove">&times;</button>
       </div>`).join('')}`;
@@ -778,7 +793,7 @@ function isolateElements(elements) {
 // ---------------------------------------------------------------- context menu
 
 function openContextMenu(hit, x, y) {
-  const item = hit && index ? index.byId.get(`${hit.modelID}:${hit.expressID}`) : null;
+  const item = pickedElement(hit);
   const hiddenCount = manualHidden.size;
 
   const parts = [];
@@ -940,15 +955,21 @@ function renderAgencyBubbles() {
  */
 
 /** Folds targets (already scoped and ordered) into component groups. */
+/**
+ * The targets in scope folded into one group per component. Several
+ * authorities query the same component (Door: BCA, NEA and SCDF), so a
+ * component is one bubble whatever asks for it; `agencies` records who does.
+ */
 function componentGroups(targets) {
   const groups = new Map();
   for (const t of targets) {
-    const key = t.agency + '|' + t.component;
-    let g = groups.get(key);
-    if (!g) groups.set(key, (g = { key, agency: t.agency, component: t.component, targets: [] }));
+    let g = groups.get(t.component);
+    if (!g) groups.set(t.component, (g = { key: t.component, component: t.component, agencies: [], targets: [] }));
+    if (!g.agencies.includes(t.agency)) g.agencies.push(t.agency);
     g.targets.push(t);
   }
-  return [...groups.values()];
+  return [...groups.values()].sort((a, b) =>
+    a.component.localeCompare(b.component, undefined, { sensitivity: 'base' }));
 }
 
 /** Every element any of the group's selectors matches, each once. */
@@ -970,34 +991,34 @@ function elementKind(e) {
   return sub ? `${e.entity} · ${sub}` : e.entity;
 }
 
+const reqId = (r) => (r.pset + '|' + r.prop).toUpperCase();
+
 /**
- * The group's properties, grouped by the entity they apply to. A requirement
- * that several selector rows repeat (Door: DOOR, then GATE, then the combined
- * row) is listed once. Order follows the workbook.
- * @returns {Array<{entity: string, canonical: string, reqs: object[]}>}
+ * The group's properties as one flat list. A requirement that several rows
+ * repeat (Door: DOOR, then GATE, then the combined row; or BCA and SCDF both
+ * asking for it) is listed once, with the entities it applies to.
+ * @returns {Array<{req: object, entities: string[]}>}
  */
 function groupProperties(group) {
-  const byEntity = new Map();
+  const list = new Map();
   for (const t of group.targets) {
-    let e = byEntity.get(t.canonicalEntity);
-    if (!e) byEntity.set(t.canonicalEntity, (e = { entity: t.entity, canonical: t.canonicalEntity, reqs: [], seen: new Set() }));
     for (const r of t.requirements) {
-      const id = (r.pset + '|' + r.prop).toUpperCase();
-      if (e.seen.has(id)) continue;
-      e.seen.add(id);
-      e.reqs.push(r);
+      let p = list.get(reqId(r));
+      if (!p) list.set(reqId(r), (p = { req: r, entities: [] }));
+      if (!p.entities.includes(t.entity)) p.entities.push(t.entity);
     }
   }
-  return [...byEntity.values()];
+  return [...list.values()].sort((a, b) =>
+    a.req.prop.localeCompare(b.req.prop, undefined, { sensitivity: 'base' }) ||
+    a.req.pset.localeCompare(b.req.pset, undefined, { sensitivity: 'base' }));
 }
 
-/** Elements of the group's `entity` selectors that carry this requirement. */
-function propertyElements(group, canonical, req) {
-  const id = (req.pset + '|' + req.prop).toUpperCase();
+/** Elements of every selector in the group that asks for this requirement. */
+function propertyElements(group, req) {
+  const id = reqId(req);
   const seen = new Map();
   for (const t of group.targets) {
-    if (t.canonicalEntity !== canonical) continue;
-    if (!t.requirements.some((r) => (r.pset + '|' + r.prop).toUpperCase() === id)) continue;
+    if (!t.requirements.some((r) => reqId(r) === id)) continue;
     for (const e of selectElements(index, t)) seen.set(e.key, e);
   }
   return [...seen.values()];
@@ -1024,47 +1045,30 @@ function renderTree() {
 
   const active = selection ? selection.group.key : null;
   const parts = [`<div class="q-head">Components<span class="qc">${groups.length}</span></div>`];
-  let agency = null;
-  let row = [];
-  const flush = () => {
-    if (row.length) parts.push(`<div class="bubble-row plain">${row.join('')}</div>`);
-    row = [];
-  };
-  for (const g of groups) {
-    if (g.agency !== agency) {
-      flush();
-      agency = g.agency;
-      const label = agency === AGENCY_ALL
-        ? (agencyFilter ? 'All authorities (incl. ' + agencyFilter + ')' : 'All authorities')
-        : agency;
-      parts.push(`<div class="q-sub">${esc(label)}</div>`);
-    }
+  // One flat row: which authority asks is in the tooltip, not the layout.
+  parts.push(`<div class="bubble-row plain">${groups.map((g) => {
     const n = index ? groupElements(g).length : null;
-    const title = g.targets.map((t) => `${t.entity} · ${describeSubtypes(t.subtypes)}`).join('\n');
-    row.push(`<button class="bubble comp${g.key === active ? ' active' : ''}${n === 0 ? ' zero' : ''}"
+    const title = [g.agencies.map((a) => (a === AGENCY_ALL ? 'All authorities' : a)).join(', '),
+      ...g.targets.map((t) => `${t.entity} · ${describeSubtypes(t.subtypes)}`)].join('\n');
+    return `<button class="bubble comp${g.key === active ? ' active' : ''}${n === 0 ? ' zero' : ''}"
       data-g="${esc(g.key)}" title="${esc(title)}">${esc(g.component)}${
-        n === null ? '' : `<span class="bc">${n}</span>`}</button>`);
-  }
-  flush();
+        n === null ? '' : `<span class="bc">${n}</span>`}</button>`;
+  }).join('')}</div>`);
 
+  let props = [];
   if (selection) {
     const group = selection.group;
-    const entities = groupProperties(group);
-    const total = entities.reduce((s, e) => s + e.reqs.length, 0);
-    parts.push(`<div class="q-head">Properties · ${esc(group.component)}<span class="qc">${total}</span></div>`);
-    if (!total) {
+    props = groupProperties(group);
+    parts.push(`<div class="q-head">Properties · ${esc(group.component)}<span class="qc">${props.length}</span></div>`);
+    if (!props.length) {
       parts.push('<div class="empty-note">The mapping lists no properties for this component — it only declares which elements belong to it.</div>');
-    }
-    for (const e of entities) {
-      if (!e.reqs.length) continue;
-      if (entities.length > 1) parts.push(`<div class="q-sub">${esc(e.entity)}</div>`);
-      parts.push(`<div class="bubble-row plain">${e.reqs.map((r, i) => {
-        const on = selection.req && selection.entity === e.canonical &&
-          (selection.req.pset + selection.req.prop).toUpperCase() === (r.pset + r.prop).toUpperCase();
-        const hint = [r.pset, r.dataType, r.unit,
+    } else {
+      parts.push(`<div class="bubble-row plain">${props.map(({ req: r, entities }, i) => {
+        const on = selection.req && reqId(selection.req) === reqId(r);
+        const hint = [r.pset, entities.join(', '), r.dataType, r.unit,
           r.accepted.kind === 'enum' ? 'accepted: ' + r.accepted.values.join(', ') : '',
           r.accepted.kind === 'spaceValues' ? 'Space Values list' : ''].filter(Boolean).join('\n');
-        return `<button class="bubble prop${on ? ' active' : ''}" data-e="${esc(e.canonical)}" data-r="${i}"
+        return `<button class="bubble prop${on ? ' active' : ''}" data-r="${i}"
           title="${esc(hint)}">${esc(r.prop)}<span class="bp">${esc(r.pset)}</span></button>`;
       }).join('')}</div>`);
     }
@@ -1079,13 +1083,9 @@ function renderTree() {
       else selectComponent(g);
     });
   });
-  if (selection) {
-    const entities = groupProperties(selection.group);
-    el.tree.querySelectorAll('.bubble.prop').forEach((b) => {
-      const e = entities.find((x) => x.canonical === b.dataset.e);
-      b.addEventListener('click', () => selectProperty(selection.group, e.canonical, e.reqs[+b.dataset.r]));
-    });
-  }
+  el.tree.querySelectorAll('.bubble.prop').forEach((b) => {
+    b.addEventListener('click', () => selectProperty(selection.group, props[+b.dataset.r].req));
+  });
 }
 
 // ---------------------------------------------------------------- query / colour
@@ -1105,7 +1105,7 @@ function selectComponent(group) {
   // see them is explicit, so honour it and let the toggle reflect the change.
   if (elements.some((e) => e.canonicalEntity === 'IFCSPACE') && !spacesVisible) setSpacesVisible(true);
 
-  selection = { group, entity: null, req: null };
+  selection = { group, req: null };
   soloIndex = -1;
 
   const kinds = new Map();
@@ -1118,7 +1118,7 @@ function selectComponent(group) {
     .sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]))
     .map(([label, els], i) => ({ label, colour: PALETTE[i % PALETTE.length], elements: els, missing: false }));
   el.legendTitle.innerHTML =
-    `${esc(group.component)}<small>${esc(group.agency)} · ${elements.length} elements · ${kinds.size} kind${kinds.size === 1 ? '' : 's'}</small>`;
+    `${esc(group.component)}<small>${esc(group.agencies.join(', '))} · ${elements.length} elements · ${kinds.size} kind${kinds.size === 1 ? '' : 's'}</small>`;
 
   renderTree();
   renderLegend();
@@ -1126,15 +1126,15 @@ function selectComponent(group) {
 }
 
 /** Colours the elements one property applies to by that property's value. */
-function selectProperty(group, canonical, req) {
-  const elements = propertyElements(group, canonical, req);
+function selectProperty(group, req) {
+  const elements = propertyElements(group, req);
   if (!elements.length) {
     toast(`No elements in the loaded models carry ${req.pset}.${req.prop} under ${group.component}.`);
     return;
   }
-  if (canonical === 'IFCSPACE' && !spacesVisible) setSpacesVisible(true);
+  if (elements.some((e) => e.canonicalEntity === 'IFCSPACE') && !spacesVisible) setSpacesVisible(true);
 
-  selection = { group, entity: canonical, req };
+  selection = { group, req };
   soloIndex = -1;
 
   let ci = 0;
@@ -1833,6 +1833,21 @@ function showMetricInModel(metric) {
 
 // ------------------------------------------------------------- element inspector
 
+/**
+ * The indexed element a pick lands on. A geometry-less aggregate (a stair) can
+ * never be hit directly, so a hit on one of its parts resolves to the host when
+ * the part is not itself mapped (a stringer), and to the part when it is (a
+ * flight, which has requirements of its own and links back to its host).
+ */
+function pickedElement(hit) {
+  if (!hit || !index) return null;
+  const key = `${hit.modelID}:${hit.expressID}`;
+  const item = index.byId.get(key);
+  if (item) return item;
+  const hostKey = index.hostOf.get(key);
+  return hostKey ? index.byId.get(hostKey) || null : null;
+}
+
 function onPick(hit) {
   // A section drag ends with a click on the same element; while armed, that
   // click is drawing intent, not a pick.
@@ -1841,7 +1856,7 @@ function onPick(hit) {
     el.panel.classList.remove('visible');
     return;
   }
-  const item = index.byId.get(`${hit.modelID}:${hit.expressID}`);
+  const item = pickedElement(hit);
   if (!item) {
     el.panelBody.innerHTML =
       `<div class="prop-type">Element ${hit.expressID}</div>
@@ -1868,6 +1883,20 @@ function showElement(item) {
               <div class="prop-id">Express ID ${item.expressID}</div>`;
   html += rows.map(([k, v]) =>
     `<div class="prop-row"><span class="k">${esc(k)}</span><span class="v">${esc(v)}</span></div>`).join('');
+
+  // A flight is picked, but the FireExit the authority asks about sits on the
+  // stair that aggregates it. Link the two so neither reads as missing.
+  const host = item.hostKey ? index.byId.get(item.hostKey) : null;
+  if (host) {
+    html += `<div class="prop-row"><span class="k">Part of</span>
+             <span class="v"><a href="#" data-host="${esc(host.key)}">${esc(host.name || host.entity)}</a>
+             <small>${esc(host.entity)}</small></span></div>`;
+  }
+  if (item.parts && item.parts.length) {
+    const n = item.parts.length;
+    html += `<div class="prop-row"><span class="k">Geometry</span>
+             <span class="v">${n} aggregated part${n === 1 ? '' : 's'}</span></div>`;
+  }
 
   // Live pass/fail from every loaded check that can explain one element. This is
   // evaluated on demand, so it is correct whether or not a check has been run,
@@ -1926,6 +1955,15 @@ function showElement(item) {
 
   el.panelBody.innerHTML = html;
   el.panel.classList.add('visible');
+
+  const hostLink = el.panelBody.querySelector('a[data-host]');
+  if (hostLink) {
+    hostLink.addEventListener('click', (e) => {
+      e.preventDefault();
+      const target = index && index.byId.get(hostLink.dataset.host);
+      if (target) showElement(target);
+    });
+  }
 }
 
 // ------------------------------------------------- Microsoft Teams (no-op outside)

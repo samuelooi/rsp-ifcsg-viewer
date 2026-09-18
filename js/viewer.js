@@ -73,29 +73,29 @@ export class Viewer {
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.container.appendChild(this.renderer.domElement);
 
-    // Left button pans, right button orbits — right stays free of drag-panning
-    // so it reads naturally alongside its other job, opening the context menu.
-    const mouseButtons = { LEFT: THREE.MOUSE.PAN, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.ROTATE };
-
+    // Forma's mapping: left drag orbits, right or middle drag pans, the wheel
+    // zooms. A right *click* (no drag) still opens the context menu.
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.08;
-    this.controls.mouseButtons = { ...mouseButtons };
+    this.controls.mouseButtons = { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.PAN, RIGHT: THREE.MOUSE.PAN };
 
     // Locked to top-down: no orbit, just pan/zoom, so plan mode can't be tilted
-    // into a perspective view by accident.
+    // into a perspective view by accident. With nothing to orbit, left drag
+    // pans too.
     this.controlsOrtho = new OrbitControls(this.orthoCamera, this.renderer.domElement);
     this.controlsOrtho.enableDamping = true;
     this.controlsOrtho.dampingFactor = 0.08;
     this.controlsOrtho.enableRotate = false;
     this.controlsOrtho.screenSpacePanning = true;
     this.controlsOrtho.enabled = false;
-    this.controlsOrtho.mouseButtons = { ...mouseButtons };
+    this.controlsOrtho.mouseButtons = { LEFT: THREE.MOUSE.PAN, MIDDLE: THREE.MOUSE.PAN, RIGHT: THREE.MOUSE.PAN };
 
-    // Section cuts (vertical, user-drawn) and the plan level cut (horizontal),
-    // combined into one clipping-plane list on the renderer.
-    this.sectionPlanes = [];   // [{ id, plane, normal, a, b, mid, group }]
+    // Section cuts (axis-aligned, placed on a picked face) and the plan level
+    // cut (horizontal), combined into one clipping-plane list on the renderer.
+    this.sectionPlanes = [];   // [{ id, axis, normal, anchor, plane, group }]
     this._sectionSeq = 0;
+    this._sectionDrag = null;  // { id, anchor0, t0 } while a cut is being slid
     this.planClipPlane = null; // THREE.Plane | null
     this.groundY = 0;
 
@@ -146,11 +146,8 @@ export class Viewer {
     this.pickListeners = [];
     this.menuListeners = [];
 
-    this.raycaster = new THREE.Raycaster();
-    this.pointer = new THREE.Vector2();
-
-    // Both mouse buttons now drive a camera drag (left pans, right orbits), so
-    // a click/contextmenu firing on release of a drag would otherwise pick an
+    // Both mouse buttons drive a camera drag (left orbits, right pans), so a
+    // click/contextmenu firing on release of a drag would otherwise pick an
     // element or pop the menu at wherever the drag happened to end. Track each
     // button's mousedown point and ignore the follow-up if it moved.
     this._downPos = {};
@@ -421,6 +418,16 @@ export class Viewer {
     return items.map[modelID];
   }
 
+  /**
+   * The expressIDs that draw an element: itself, plus the aggregated parts the
+   * index resolved for a geometry-less container (a Revit stair's flights,
+   * landings and railings). Every per-element operation on the mesh goes
+   * through this, so a stair colours, hides and measures like any other element.
+   */
+  _geometryIds(el) {
+    return el.parts && el.parts.length ? [el.expressID, ...el.parts] : [el.expressID];
+  }
+
   // ------------------------------------------------------------- visibility
 
   hiddenSet(modelID) {
@@ -450,7 +457,10 @@ export class Viewer {
    */
   setHidden(elements) {
     this.hiddenByModel.clear();
-    for (const el of elements) this.hiddenSet(el.modelID).add(el.expressID);
+    for (const el of elements) {
+      const set = this.hiddenSet(el.modelID);
+      for (const id of this._geometryIds(el)) set.add(id);
+    }
     this.hiddenVersion++;
     this.refresh();
   }
@@ -562,12 +572,16 @@ export class Viewer {
       }
 
       // Colour overlays, one subset per group per model, skipping hidden members.
+      const hidden = this.hiddenByModel.get(entry.modelID);
       this.groups.forEach((g, gi) => {
         const ids = [];
         for (const el of g.elements) {
           if (el.modelID !== entry.modelID) continue;
           if (this.isHidden(el)) continue;
-          ids.push(el.expressID);
+          // A part the user hid on its own stays hidden under its host's colour.
+          for (const id of this._geometryIds(el)) {
+            if (!hidden || !hidden.has(id)) ids.push(id);
+          }
         }
         if (!ids.length) return;
 
@@ -716,7 +730,7 @@ export class Viewer {
     const perModel = new Map();
     for (const el of elements || []) {
       if (!perModel.has(el.modelID)) perModel.set(el.modelID, []);
-      perModel.get(el.modelID).push(el.expressID);
+      perModel.get(el.modelID).push(...this._geometryIds(el));
     }
 
     const sources = [];
@@ -980,23 +994,25 @@ export class Viewer {
    * wasm model (already released by the time this is useful) nor any placement
    * math of our own — whatever the mesh actually shows is the ground truth.
    */
-  elementYRange(modelID, expressID) {
+  elementYRange(modelID, expressID, expressIDs = [expressID]) {
     const entry = this.models.get(modelID);
     if (!entry) return null;
     const items = this._itemsMap(modelID);
     if (!items) return null;
-    const byMaterial = items.map.get(expressID);
-    if (!byMaterial) return null;
 
     const pos = entry.mesh.geometry.attributes.position;
     const idx = items.indexCache;
     let min = Infinity, max = -Infinity;
-    for (const ranges of Object.values(byMaterial)) {
-      for (let p = 0; p < ranges.length; p += 2) {
-        for (let j = ranges[p]; j <= ranges[p + 1]; j++) {
-          const y = pos.getY(idx[j]);
-          if (y < min) min = y;
-          if (y > max) max = y;
+    for (const id of expressIDs) {
+      const byMaterial = items.map.get(id);
+      if (!byMaterial) continue;
+      for (const ranges of Object.values(byMaterial)) {
+        for (let p = 0; p < ranges.length; p += 2) {
+          for (let j = ranges[p]; j <= ranges[p + 1]; j++) {
+            const y = pos.getY(idx[j]);
+            if (y < min) min = y;
+            if (y > max) max = y;
+          }
         }
       }
     }
@@ -1014,7 +1030,8 @@ export class Viewer {
     const step = Math.max(1, Math.floor(elements.length / max));
     const mins = [];
     for (let i = 0; i < elements.length; i += step) {
-      const r = this.elementYRange(elements[i].modelID, elements[i].expressID);
+      const e = elements[i];
+      const r = this.elementYRange(e.modelID, e.expressID, this._geometryIds(e));
       if (r) mins.push(r.min);
     }
     if (!mins.length) return null;
@@ -1025,23 +1042,41 @@ export class Viewer {
   // ------------------------------------------------------------ section cuts
 
   /**
-   * Adds a vertical cutting plane through two ground points, keeping the half
-   * that contains `cameraPos` (flip it afterwards with `flipSectionPlane`).
+   * The model face under the pointer, with its normal snapped to the nearest
+   * world axis. Forma places a section on a clicked face; snapping keeps every
+   * cut a clean X, Y or Z plane whatever the face was actually drawn at.
+   * @returns {{point: THREE.Vector3, normal: THREE.Vector3, axis: 'x'|'y'|'z'}|null}
    */
-  addSectionPlane(a, b, cameraPos) {
-    const dir = new THREE.Vector3().subVectors(b, a);
-    dir.y = 0;
-    if (dir.lengthSq() < 1e-6) return null;
-    dir.normalize();
+  raycastFace(event) {
+    const hit = this._raycastVisible(event);
+    if (!hit || !hit.face) return null;
 
-    const normal = new THREE.Vector3(-dir.z, 0, dir.x);
-    const mid = new THREE.Vector3().addVectors(a, b).multiplyScalar(0.5);
-    const toCam = new THREE.Vector3().subVectors(cameraPos, mid);
-    if (normal.dot(toCam) < 0) normal.negate();
+    const normal = hit.face.normal.clone()
+      .transformDirection(hit.object.matrixWorld);
+    const ax = Math.abs(normal.x), ay = Math.abs(normal.y), az = Math.abs(normal.z);
+    const axis = ax >= ay && ax >= az ? 'x' : ay >= az ? 'y' : 'z';
+    const snapped = new THREE.Vector3();
+    snapped[axis] = Math.sign(normal[axis]) || 1;
+    return { point: hit.point.clone(), normal: snapped, axis };
+  }
 
-    const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(normal, mid);
+  /**
+   * Adds an axis-aligned cutting plane through a picked face, discarding the
+   * half the camera is on — click the outside of a wall and the cut sits on
+   * that wall, ready to be slid inward (flip it with `flipSectionPlane`).
+   * @param {{point: THREE.Vector3, normal: THREE.Vector3, axis: string}} face
+   */
+  addSectionAtFace(face, cameraPos) {
+    const normal = face.normal.clone().normalize();
+    const toCam = new THREE.Vector3().subVectors(cameraPos, face.point);
+    if (normal.dot(toCam) > 0) normal.negate();
+
     const id = ++this._sectionSeq;
-    const entry = { id, plane, normal, a: a.clone(), b: b.clone(), mid, group: null };
+    const entry = {
+      id, axis: face.axis, normal, anchor: face.point.clone(),
+      plane: new THREE.Plane().setFromNormalAndCoplanarPoint(normal, face.point),
+      group: null,
+    };
     entry.group = this._buildSectionHelper(entry);
     this.scene.add(entry.group);
     this.sectionPlanes.push(entry);
@@ -1053,11 +1088,72 @@ export class Viewer {
     const s = this.sectionPlanes.find((x) => x.id === id);
     if (!s) return;
     s.normal.negate();
-    s.plane.setFromNormalAndCoplanarPoint(s.normal, s.mid);
+    this._rebuildSection(s);
+  }
+
+  /** Re-derives a cut's clipping plane and helper after its normal or anchor moved. */
+  _rebuildSection(s) {
+    s.plane.setFromNormalAndCoplanarPoint(s.normal, s.anchor);
     this.scene.remove(s.group);
     s.group = this._buildSectionHelper(s);
     this.scene.add(s.group);
     this._updateClipping();
+  }
+
+  /**
+   * Where the pointer sits along a cut's axis: the parameter t of the closest
+   * point on the line `anchor + t·normal` to the pointer ray. Null when the
+   * axis runs straight into the screen and has no usable direction.
+   */
+  _sectionAxisParam(s, event, origin = s.anchor) {
+    const ray = this._pointerRay(event).ray;
+    const d = s.normal, r = ray.direction;
+    const w0 = new THREE.Vector3().subVectors(origin, ray.origin);
+    const b = d.dot(r);
+    const denom = 1 - b * b;
+    if (denom < 1e-6) return null;
+    return (b * r.dot(w0) - d.dot(w0)) / denom;
+  }
+
+  /**
+   * Starts sliding a cut if the pointer is on one of the cut helpers.
+   * @returns {number|null} the grabbed cut's id
+   */
+  grabSection(event) {
+    if (!this.sectionPlanes.length) return null;
+    const targets = this.sectionPlanes.map((s) => s.group);
+    const hits = this._pointerRay(event).intersectObjects(targets, true);
+    if (!hits.length) return null;
+
+    let obj = hits[0].object;
+    while (obj && obj.userData.sectionId === undefined) obj = obj.parent;
+    const s = obj && this.sectionPlanes.find((x) => x.id === obj.userData.sectionId);
+    if (!s) return null;
+
+    const t0 = this._sectionAxisParam(s, event);
+    if (t0 === null) return null;
+    this._sectionDrag = { id: s.id, anchor0: s.anchor.clone(), t0 };
+    return s.id;
+  }
+
+  /** Slides the grabbed cut along its axis to follow the pointer. */
+  dragSection(event) {
+    const drag = this._sectionDrag;
+    if (!drag) return;
+    const s = this.sectionPlanes.find((x) => x.id === drag.id);
+    if (!s) return;
+    const t = this._sectionAxisParam(s, event, drag.anchor0);
+    if (t === null) return;
+    s.anchor.copy(drag.anchor0).addScaledVector(s.normal, t - drag.t0);
+    this._rebuildSection(s);
+  }
+
+  endSectionDrag() {
+    this._sectionDrag = null;
+  }
+
+  get sectionDragging() {
+    return this._sectionDrag !== null;
   }
 
   removeSectionPlane(id) {
@@ -1080,22 +1176,50 @@ export class Viewer {
     this.renderer.clippingPlanes = planes;
   }
 
-  /** The cut line on the ground plus an arrow pointing into the kept half. */
-  _buildSectionHelper({ a, b, mid, normal }) {
+  /**
+   * The cut drawn as a translucent rectangle where the plane slices the model's
+   * bounding box, with an arrow at the anchor pointing into the kept half. The
+   * rectangle is also the handle: dragging it slides the cut along its axis.
+   */
+  _buildSectionHelper({ id, axis, normal, anchor }) {
     const group = new THREE.Group();
-    const y = this.groundY;
-    const pa = new THREE.Vector3(a.x, y, a.z);
-    const pb = new THREE.Vector3(b.x, y, b.z);
+    group.userData.sectionId = id;
 
-    const geo = new THREE.BufferGeometry().setFromPoints([pa, pb]);
-    const line = new THREE.Line(geo, new THREE.LineBasicMaterial({ color: 0xffcf5c, depthTest: false }));
-    line.renderOrder = 999;
-    group.add(line);
+    const box = this._visibleBox() || new THREE.Box3(
+      new THREE.Vector3(-10, -10, -10), new THREE.Vector3(10, 10, 10));
+    const size = box.getSize(new THREE.Vector3());
+    box.expandByScalar(Math.max(size.x, size.y, size.z) * 0.04);
 
-    const len = pa.distanceTo(pb) || 1;
+    // The two in-plane axes, and the rectangle corners at the anchor's offset.
+    const [u, v] = axis === 'x' ? ['y', 'z'] : axis === 'y' ? ['x', 'z'] : ['x', 'y'];
+    const corner = (uMin, vMin) => {
+      const p = new THREE.Vector3();
+      p[axis] = anchor[axis];
+      p[u] = uMin ? box.min[u] : box.max[u];
+      p[v] = vMin ? box.min[v] : box.max[v];
+      // Nudged into the kept half so the plane never clips its own handle.
+      return p.addScaledVector(normal, 1e-3);
+    };
+    const corners = [corner(true, true), corner(false, true), corner(false, false), corner(true, false)];
+
+    const outline = new THREE.LineLoop(
+      new THREE.BufferGeometry().setFromPoints(corners),
+      new THREE.LineBasicMaterial({ color: 0xffcf5c, depthTest: false }));
+    outline.renderOrder = 999;
+    group.add(outline);
+
+    const quad = new THREE.BufferGeometry().setFromPoints(
+      [corners[0], corners[1], corners[2], corners[0], corners[2], corners[3]]);
+    quad.computeVertexNormals();
+    const fill = new THREE.Mesh(quad, new THREE.MeshBasicMaterial({
+      color: 0xffcf5c, transparent: true, opacity: 0.07, side: THREE.DoubleSide, depthWrite: false,
+    }));
+    fill.renderOrder = 998;
+    group.add(fill);
+
+    const len = Math.max(Math.max(size.x, size.y, size.z) * 0.08, 0.6);
     const arrow = new THREE.ArrowHelper(
-      normal.clone(), new THREE.Vector3(mid.x, y, mid.z),
-      Math.max(len * 0.18, 0.6), 0xffcf5c, Math.max(len * 0.06, 0.25), Math.max(len * 0.04, 0.18));
+      normal.clone(), anchor.clone(), len, 0xffcf5c, len * 0.35, len * 0.2);
     arrow.line.material.depthTest = false;
     arrow.cone.material.depthTest = false;
     arrow.renderOrder = 999;
@@ -1104,23 +1228,37 @@ export class Viewer {
     return group;
   }
 
-  /** Ray-casts the pointer against loaded geometry, falling back to the ground plane. */
-  raycastGround(event) {
+  /** A raycaster aimed through the pointer from whichever camera is active. */
+  _pointerRay(event) {
     const rect = this.renderer.domElement.getBoundingClientRect();
     const ndc = new THREE.Vector2(
       ((event.clientX - rect.left) / rect.width) * 2 - 1,
       -((event.clientY - rect.top) / rect.height) * 2 + 1);
     const ray = new THREE.Raycaster();
     ray.setFromCamera(ndc, this.activeCamera);
+    return ray;
+  }
 
+  /**
+   * The nearest model surface under the pointer that the renderer actually
+   * draws. The raycaster sees the full, unclipped geometry, so the nearest hit
+   * can be something a section or plan cut is hiding (the roof, from above a
+   * plan cut) — skip past anything on the discarded side of an active plane.
+   */
+  _raycastVisible(event, includeOverlays = true) {
+    if (!this.hasModels) return null;
     const targets = [];
     for (const entry of this.models.values()) if (entry.visible) targets.push(entry.mesh);
-    const hits = ray.intersectObjects(targets, true).filter((h) => h.object.visible);
-    if (hits.length) return hits[0].point.clone();
+    // Overlay subsets live on the scene, not under a model, so both have to be
+    // offered to the raycaster or picking would stop working during a query.
+    if (includeOverlays) for (const o of this.overlays) if (o.mesh) targets.push(o.mesh);
 
-    const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -this.groundY);
-    const pt = new THREE.Vector3();
-    return ray.ray.intersectPlane(plane, pt) ? pt : null;
+    const hits = this._pointerRay(event).intersectObjects(targets, true).filter((h) => h.object.visible);
+    if (!hits.length) return null;
+    const planes = this.renderer.clippingPlanes;
+    return planes && planes.length
+      ? hits.find((h) => planes.every((p) => p.distanceToPoint(h.point) >= 0)) || null
+      : hits[0];
   }
 
   // ----------------------------------------------------------------- picking
@@ -1138,30 +1276,7 @@ export class Viewer {
 
   /** @returns {{modelID:number, expressID:number}|null} */
   _pickAt(event) {
-    if (!this.hasModels) return null;
-
-    const rect = this.renderer.domElement.getBoundingClientRect();
-    this.pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-    this.pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
-    this.raycaster.setFromCamera(this.pointer, this.activeCamera);
-
-    // Overlay subsets live on the scene, not under a model, so both have to be
-    // offered to the raycaster or picking would stop working during a query.
-    const targets = [];
-    for (const entry of this.models.values()) if (entry.visible) targets.push(entry.mesh);
-    for (const o of this.overlays) if (o.mesh) targets.push(o.mesh);
-
-    const hits = this.raycaster.intersectObjects(targets, true).filter((h) => h.object.visible);
-    if (!hits.length) return null;
-
-    // The raycaster sees the full, unclipped geometry, so the nearest hit can be
-    // something a section or plan cut is actually hiding (e.g. the roof, from
-    // above a plan cut) — skip past anything on the discarded side of any
-    // active clipping plane to the first hit the renderer would actually draw.
-    const planes = this.renderer.clippingPlanes;
-    const hit = planes && planes.length
-      ? hits.find((h) => planes.every((p) => p.distanceToPoint(h.point) >= 0))
-      : hits[0];
+    const hit = this._raycastVisible(event);
     if (!hit) return null;
 
     try {

@@ -190,7 +190,6 @@
   }
   .q-head + .q-head, .bubble-row.plain + .q-head { border-top: 1px solid var(--border); margin-top: 4px; }
   .q-head .qc { margin-left: auto; font-weight: 400; color: var(--text-dim); font-variant-numeric: tabular-nums; }
-  .q-sub { padding: 6px 10px 1px; font-size: 10.5px; color: var(--text-dim); }
   .bubble-row.plain { border-bottom: none; padding: 5px 10px 6px; }
   .bubble.comp, .bubble.prop { max-width: 100%; }
   .bubble.comp .bc, .bubble.prop .bp { overflow: hidden; text-overflow: ellipsis; }
@@ -547,6 +546,7 @@
     border-top: 1px solid #2e333c;
   }
   #sections-bar .sb-row .lbl { flex: 1; }
+  #sections-bar .sb-row .lbl small { color: var(--text-dim); margin-left: 4px; }
   #sections-bar .sb-row button {
     background: none; border: none; color: var(--text-dim); cursor: pointer;
     font-size: 13px; padding: 2px 5px; line-height: 1;
@@ -731,7 +731,7 @@
     <div class="rail-btn" id="tool-fit" title="Fit to view">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
     </div>
-    <div class="rail-btn" id="tool-section" title="Section cut: click-drag a line across the model (like Forma)">
+    <div class="rail-btn" id="tool-section" title="Section cut: click a face of the model (like Forma)">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4">
         <rect x="3" y="5" width="18" height="14" rx="1"/>
         <path d="M3 15.5l18-8" stroke-dasharray="2.2 2.2"/>

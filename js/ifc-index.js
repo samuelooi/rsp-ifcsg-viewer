@@ -263,6 +263,14 @@ export function buildIndex(api, modelID, ruleset, onProgress = () => {}) {
         tag: unwrap(line.Tag),
         storey: null,
         psets: {},
+        // Whether the element draws anything itself. Revit exports a stair,
+        // roof or curtain wall as a container with no Representation; all the
+        // triangles belong to the parts it aggregates (see `parts` below).
+        hasGeometry: !!(line.Representation && line.Representation.value !== undefined),
+        /** expressIDs of the aggregated descendants that carry this element's geometry. */
+        parts: [],
+        /** `key` of the geometry-less aggregate this element is a part of, if any. */
+        hostKey: null,
       };
       byId.set(id, el);
       if (!byEntity.has(canon)) byEntity.set(canon, []);
@@ -382,7 +390,8 @@ export function buildIndex(api, modelID, ruleset, onProgress = () => {}) {
   // the storey — so build the spatial hierarchy first and walk up from whatever
   // the relationship names until a storey is reached.
   const storeyNames = new Map();   // expressID -> storey name
-  const parentOf = new Map();      // spatial expressID -> containing expressID
+  const parentOf = new Map();      // aggregated expressID -> its RelatingObject
+  const childrenOf = new Map();    // RelatingObject expressID -> aggregated expressIDs
   const storeys = [];              // [{ expressID, name, elevation, declared, unit, … }]
 
   /**
@@ -444,11 +453,55 @@ export function buildIndex(api, modelID, ruleset, onProgress = () => {}) {
         continue;
       }
       if (!Array.isArray(rel.RelatedObjects) || !rel.RelatingObject) continue;
+      const parent = rel.RelatingObject.value;
+      if (!childrenOf.has(parent)) childrenOf.set(parent, []);
       for (const h of rel.RelatedObjects) {
-        if (h) parentOf.set(h.value, rel.RelatingObject.value);
+        if (!h) continue;
+        parentOf.set(h.value, parent);
+        childrenOf.get(parent).push(h.value);
       }
     }
   } catch { /* no aggregation */ }
+
+  // ------------------------------------------------------- aggregate geometry
+  // A geometry-less aggregate (a Revit stair: flights, landings, stringers and
+  // railings under one IfcStair) has to be coloured, hidden and measured
+  // through its parts, since a subset of its own expressID draws nothing.
+  // Spatial elements aggregate too (site -> building -> storey -> spaces) but
+  // are never expanded: colouring a building must not paint its rooms.
+  const SPATIAL = new Set(['IFCSITE', 'IFCBUILDING', 'IFCBUILDINGSTOREY', 'IFCSPACE']);
+
+  /** Every aggregated descendant, depth first, stopping at spatial elements. */
+  function descendants(id, out, seen) {
+    for (const child of childrenOf.get(id) || []) {
+      if (seen.has(child)) continue;
+      seen.add(child);
+      const el = byId.get(child);
+      if (el && SPATIAL.has(el.canonicalEntity)) continue;
+      out.push(child);
+      descendants(child, out, seen);
+    }
+  }
+
+  // Nearest geometry-less host above a part. A host nested inside another host
+  // is the nearer one, so it is assigned last and wins.
+  const hostOf = new Map(); // part expressID -> host expressID
+  const hosts = [...byId.values()].filter((el) =>
+    !el.hasGeometry && !SPATIAL.has(el.canonicalEntity) && childrenOf.has(el.expressID));
+  const depth = (id) => {
+    let d = 0;
+    for (let cur = parentOf.get(id); cur != null && d < 32; cur = parentOf.get(cur)) d++;
+    return d;
+  };
+  hosts.sort((a, b) => depth(a.expressID) - depth(b.expressID));
+  for (const host of hosts) {
+    descendants(host.expressID, host.parts, new Set([host.expressID]));
+    for (const part of host.parts) hostOf.set(part, host.expressID);
+  }
+  for (const [part, host] of hostOf) {
+    const el = byId.get(part);
+    if (el) el.hostKey = `${modelID}:${host}`;
+  }
 
   /** Nearest enclosing storey name, or null if the chain never reaches one. */
   function storeyFor(id) {
@@ -498,6 +551,10 @@ export function buildIndex(api, modelID, ruleset, onProgress = () => {}) {
     count: all.length,
     georef,
     storeys,
+    // `key` of a part -> `key` of its geometry-less host. Parts that are not
+    // themselves indexed (a stair's IfcMember stringers) are only reachable
+    // through this, so a click on one can still resolve to the stair.
+    hostOf: new Map([...hostOf].map(([part, host]) => [`${modelID}:${part}`, `${modelID}:${host}`])),
   };
 }
 
@@ -516,6 +573,7 @@ export function mergeIndexes(indexes) {
   const georef = indexes.length ? indexes[0].georef : null;
   const georefByModel = new Map(indexes.map((idx) => [idx.modelID, idx.georef]));
   const storeys = indexes.flatMap((idx) => idx.storeys || []);
+  const hostOf = new Map();
 
   for (const idx of indexes) {
     for (const el of idx.all) {
@@ -524,7 +582,8 @@ export function mergeIndexes(indexes) {
       if (!byEntity.has(el.canonicalEntity)) byEntity.set(el.canonicalEntity, []);
       byEntity.get(el.canonicalEntity).push(el);
     }
+    for (const [part, host] of idx.hostOf || []) hostOf.set(part, host);
   }
 
-  return { byId, byEntity, all, count: all.length, georef, georefByModel, storeys };
+  return { byId, byEntity, all, count: all.length, georef, georefByModel, storeys, hostOf };
 }
