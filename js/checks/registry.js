@@ -26,6 +26,17 @@ const MANIFEST = [
       'Every mapped element carries the property sets, properties and accepted values ' +
       'the CORENET X mapping requires. Checks the data, not the building.',
     requires: { ruleset: true },
+    inputs: [
+      {
+        id: 'presets',
+        kind: 'custom',
+        label: 'Value presets',
+        help: 'Your own property queries, shared with the team through ' +
+          'data/value-presets.json. Ticked presets run with this check; "3D" shows ' +
+          'what a preset selects. Numbers are in the units the model was authored in.',
+        load: () => import('./ifc-values/preset-editor.js'),
+      },
+    ],
     load: () => import('./ifc-values/index.js'),
   },
   {
@@ -139,6 +150,13 @@ export function requiredEntities() {
     }
   }
   return entities;
+}
+
+/** Every `kind: 'custom'` input, as [{ key: '<checkId>.<inputId>', check, input }]. */
+export function customInputs() {
+  return MANIFEST.flatMap((check) => (check.inputs || [])
+    .filter((input) => input.kind === 'custom')
+    .map((input) => ({ key: check.id + '.' + input.id, check, input })));
 }
 
 // ------------------------------------------------------------------- loading

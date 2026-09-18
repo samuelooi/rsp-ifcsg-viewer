@@ -38,13 +38,26 @@
  *
  * @typedef {object} CheckInput
  * @property {string} id           Key it arrives under in `ctx.inputs`.
- * @property {'file'|'text'|'select'} kind
+ * @property {'file'|'text'|'select'|'custom'} kind
  * @property {string} label
  * @property {string} [accept]     File-picker filter, for `kind: 'file'`.
  * @property {string} [placeholder]
  * @property {Array<{value: string, label: string}>} [options]  For `kind: 'select'`.
  * @property {*} [default]         Supplied in `ctx.inputs` when the user leaves it alone.
  * @property {string} [help]       Shown under the control.
+ * @property {() => Promise<CustomInputModule>} [load]  For `kind: 'custom'`.
+ */
+
+/**
+ * A control too rich for the built-in kinds, such as the value-preset editor.
+ * Loaded at boot so its entities are known before any model is indexed.
+ *
+ * @typedef {object} CustomInputModule
+ * @property {(host: HTMLElement, api: object) => void|Promise<void>} mount
+ *           Renders into `host`. Called again whenever the menu is redrawn, so
+ *           any state worth keeping must live in the module.
+ * @property {() => *} value  What arrives in `ctx.inputs[id]` when the check runs.
+ * @property {() => Promise<string[]>} [requiredEntities]  Upper-case IFC entities to index.
  */
 
 /**

@@ -7,16 +7,20 @@
   Re-run this whenever BCA publishes an updated mapping workbook:
       powershell -File tools/build-ifcsg-rules.ps1 -Xlsx "<path to mapping.xlsx>"
 
-  Workbook layout this expects (CX Pilot Mapping sheet, 19 columns):
-      1 S/N   2 Agency   3 Identified Component   4 Identified parameters
-      5-8 Suggested authoring-tool representations   9 Suggested Discipline
-      10 IFC4 Entities   11 IFC Sub Types (* = USERDEFINED)
-      12 Property Set   13 Property Name   14 Property Type   15 Property Unit
-      16 IFC4 Material Set   17 Accepted Values   18 Sample Value
+  Columns on the CX Pilot Mapping sheet are found by header text, not position,
+  so a column inserted into the workbook does not shift the rest. Headers used:
+      S/N, Agency, Gateway, Identified Component, Identified parameters,
+      Suggested Revit Representation, Suggested Discipline, IFC4 Entities,
+      IFC Sub Types, Property Set, Property Name, Property Type, Property Unit,
+      IFC4 Material Set, Accepted Values, Sample Value
+
+  "Gateway" is RSP's own column (DG = Design Gateway, CG = Construction Gateway),
+  added to the authority workbook. It is read per row: within one component
+  the Design Gateway can ask for fewer properties than the Construction Gateway.
 #>
 [CmdletBinding()]
 param(
-  [string]$Xlsx = "C:\Users\tx_samuel_ooi\OneDrive - RSP ARCHITECTS PLANNERS & ENGINEERS (PTE) LTD\Documents\20260305 IFC Model Checker\industry-mapping-4-dec-2025139335b79c8943d695c7b84984c9d50b (1).xlsx",
+  [string]$Xlsx = "C:\Users\tx_samuel_ooi\OneDrive - RSP ARCHITECTS PLANNERS & ENGINEERS (PTE) LTD\Documents\20260305 IFC Model Checker\industry-mapping-4-dec-2025139335b79c8943d695c7b84984c9d50b_gateway mapping.xlsx",
   [string]$Out = '',
 
   # Which "Suggested Discipline" rows to keep. Defaults to the architectural
@@ -83,6 +87,18 @@ function Parse-Subtypes {
     $list.Add([pscustomobject]@{ value = $p; userDefined = $ud; anySubtype = $false })
   }
   return , @($list.ToArray())
+}
+
+# The Gateway column's codes, mapped to the ids js/ifcsg.js uses.
+function Parse-Gateway {
+  param([string]$s)
+  $v = Norm $s
+  if (-not $v) { return $null }
+  switch -Regex ($v.ToUpperInvariant()) {
+    '^(DG|DESIGN( GATEWAY)?)$'       { return 'design' }
+    '^(CG|CONSTRUCTION( GATEWAY)?)$' { return 'construction' }
+    default { throw "Unrecognised Gateway value '$s'. Expected DG or CG." }
+  }
 }
 
 # Accepted Values is either an enumeration, a cross-reference to the Space Values
@@ -160,47 +176,75 @@ try {
   $mapRows = Read-Sheet -File 'sheet3.xml' -MinWidth 19
   $rules = New-Object System.Collections.Generic.List[object]
 
+  # Locate each column by its header. Headers in the workbook wrap onto several
+  # lines and carry parenthetical notes, so match on a leading fragment.
+  $header = $mapRows[0]
+  $col = @{}
+  $wanted = [ordered]@{
+    sn = 'S/N'; agency = 'Agency'; gateway = 'Gateway'
+    component = 'Identified Component'; parameter = 'Identified parameters'
+    revit = 'Suggested Revit'; discipline = 'Suggested Discipline'
+    entity = 'IFC4 Entities'; subtypes = 'IFC Sub Types'
+    pset = 'Property Set'; prop = 'Property Name'; dataType = 'Property Type'
+    unit = 'Property Unit'; materialSet = 'IFC4 Material Set'
+    accepted = 'Accepted Values'; sample = 'Sample Value'
+  }
+  foreach ($key in $wanted.Keys) {
+    $label = $wanted[$key]
+    for ($c = 0; $c -lt $header.Length; $c++) {
+      $h = ($header[$c] -replace '\s+', ' ').Trim()
+      if ($h.StartsWith($label, [System.StringComparison]::OrdinalIgnoreCase)) { $col[$key] = $c; break }
+    }
+    if (-not $col.ContainsKey($key)) {
+      if ($key -eq 'gateway') { Write-Warning "No 'Gateway' column found; every rule will be Construction Gateway only." }
+      else { throw "Column '$label' not found on the CX Pilot Mapping sheet." }
+    }
+  }
+  function Cell { param($row, [string]$key) if ($col.ContainsKey($key)) { $row[$col[$key]] } else { '' } }
+
   $skipped = @{}
   for ($i = 1; $i -lt $mapRows.Count; $i++) {
     $r = $mapRows[$i]
-    $entity = Norm $r[9]
+    $entity = Norm (Cell $r 'entity')
     if (-not $entity) { continue }                      # blank / spacer row
 
-    $disc = Norm $r[8]
+    $disc = Norm (Cell $r 'discipline')
     if ($Disciplines -and $Disciplines.Count -and ($Disciplines -notcontains $disc)) {
       $k = if ($disc) { $disc } else { '(none)' }
       $skipped[$k] = 1 + $(if ($skipped.ContainsKey($k)) { $skipped[$k] } else { 0 })
       continue
     }
 
-    $declaresOnly = (Test-Placeholder $r[11]) -or (Test-Placeholder $r[12])
+    $declaresOnly = (Test-Placeholder (Cell $r 'pset')) -or (Test-Placeholder (Cell $r 'prop'))
     if ($declaresOnly) { $pset = $null; $prop = $null }
-    else { $pset = Norm $r[11]; $prop = Norm $r[12] }
+    else { $pset = Norm (Cell $r 'pset'); $prop = Norm (Cell $r 'prop') }
 
-    $agency = Norm $r[1]
+    $agency = Norm (Cell $r 'agency')
     if ($agency) { $agency = $agency.ToUpperInvariant() }   # "NParks" -> "NPARKS"
 
     if ($pset -and $prop) { $kind = 'requirement' } else { $kind = 'subtype' }
 
     $rules.Add([pscustomobject]@{
-        sn          = Norm $r[0]
+        sn          = Norm (Cell $r 'sn')
         agency      = $agency
-        component   = Norm $r[2]
-        parameter   = Norm $r[3]
-        discipline  = Norm $r[8]
+        # 'design' | 'construction' | null. Per row, not per component.
+        gateway     = (Parse-Gateway (Cell $r 'gateway'))
+        component   = Norm (Cell $r 'component')
+        parameter   = Norm (Cell $r 'parameter')
+        discipline  = $disc
         entity      = $entity
-        subtypes    = (Parse-Subtypes $r[10])
+        subtypes    = (Parse-Subtypes (Cell $r 'subtypes'))
         # 'requirement' rows demand a property; 'subtype' rows only declare that
         # this entity+subtype belongs to the component.
         kind        = $kind
         pset        = $pset
         prop        = $prop
-        dataType    = Norm $r[13]
-        unit        = Norm $r[14]
-        materialSet = Norm $r[15]
-        accepted    = (Parse-Accepted $r[16])
-        sample      = Norm $r[17]
-        revit       = Norm $r[4]
+        dataType    = Norm (Cell $r 'dataType')
+        unit        = Norm (Cell $r 'unit')
+        materialSet = Norm (Cell $r 'materialSet')
+        accepted    = (Parse-Accepted (Cell $r 'accepted'))
+        sample      = Norm (Cell $r 'sample')
+        revit       = Norm (Cell $r 'revit')
       })
   }
 
@@ -258,6 +302,13 @@ try {
   Write-Output ("  rules:        {0}" -f $ruleArr.Count)
   Write-Output ("  requirements: {0}" -f $reqCount)
   Write-Output ("  agencies:     {0}" -f ($doc.agencies -join ', '))
+  # DG rows count for both gateways; CG and blank rows for Construction only.
+  $gw = @{ design = 0; construction = 0; blank = 0 }
+  foreach ($rule in $ruleArr) {
+    if ($rule.gateway -eq 'design') { $gw.design++ } elseif (-not $rule.gateway) { $gw.blank++ }
+    $gw.construction++
+  }
+  Write-Output ("  gateway:      design {0} (also in construction), construction {1}, blank {2}" -f $gw.design, $gw.construction, $gw.blank)
   Write-Output ("  space values: {0} properties" -f $spaceValuesOut.Keys.Count)
 }
 finally {

@@ -17,13 +17,19 @@ powershell -File tools/serve.ps1 -Port 9000
 
 Then open the URL and drop one or more `.ifc` files on the window.
 
+The server also handles `GET` and `PUT` requests to `/api/presets`, which read
+and save `data/value-presets.json` (see [Value presets](#value-presets)). It
+only listens on `localhost`, and it refuses writes that come from another
+origin.
+
 ## Working with models
 
 **Several files can be open at once** and are treated as one federated model —
 queries, colouring and the compliance check all span them. Drop or choose
-multiple files, or add them one at a time. Each loaded file appears at the top of
-the left panel with its mapped-element count, an eye toggle to show/hide it, and
-a `×` to close it.
+multiple files, or add them one at a time. The model name at the top left is a
+drop-down listing every loaded file with its mapped-element count, an eye toggle
+to show/hide it, and a `×` to close it. With nothing loaded, clicking it opens
+the file picker.
 
 Because `expressID` is only unique *within* one IFC file (they genuinely collide
 between files), every element is identified as `modelID:expressID` throughout.
@@ -47,7 +53,9 @@ millimetres of precision.
 
 - **Right-click any element** for a menu: hide it, hide everything of that entity
   type, isolate it, show its properties, or **Show all**. Right-clicking empty
-  space gives you Show all and Fit view.
+  space gives you Show all and Fit view. While a query is showing, **Isolate
+  selected components** hides everything the query does not colour — with a
+  legend row soloed, only that row's elements stay.
 - **The space toggle** in the tool rail shows or hides `IfcSpace` volumes. Spaces
   start hidden, because they are solid volumes that bury the rest of the model.
   Running a query or check result that targets spaces turns them back on
@@ -104,18 +112,33 @@ the discipline scope.
 
 ### Preset queries (Queries tab)
 
-The left panel lists every building component the mapping identifies, grouped by
-agency. Each row shows the IFC entity and accepted subtypes, plus how many
-matching elements are in the loaded model.
+The left panel shows every building component the mapping identifies as a
+bubble, grouped by agency, with how many matching elements the loaded model
+holds. Hover a bubble to see the IFC entities and subtypes it covers.
 
-- **Click a component** — colours those elements and ghosts the rest.
-- **Expand it and click a property** — colours the elements *by that property's
-  value*, with a legend of every distinct value and its count. Elements that do
-  not carry the property fall into a red `(not set)` bucket.
+- **Click a component** — colours its elements *by what each one is* (entity
+  plus subtype), with a legend of every kind and its count. *Family-Friendly
+  Furniture* therefore splits into CHANGINGBED, CHILDPROTECTIONSEAT and
+  DIAPERCHANGINGTABLE. The workbook lists a component once per selector row and
+  those rows overlap (Railing: any subtype *and* GUARDRAIL); the rows are folded
+  together and each element counted once, so the numbers add up.
+- **A Properties section then appears** with one bubble per property the
+  mapping requires. A component spanning several entities (Household Shelter:
+  walls, spaces, outlets…) lists them under entity labels, since a property
+  belongs to one entity. **Click a property** — colours the elements of that
+  entity *by the property's value*, with a legend of every distinct value and
+  its count; elements that do not carry the property fall into a red `(not set)`
+  bucket, and the rest of the component is ghosted.
 - **Click a legend row** — solos that value. Click it again to bring the rest back.
 
-Filters narrow the list by agency, by discipline, or by free text, and
-"Only components present in model" hides everything the model does not contain.
+Two rows of bubbles above the list set the scope, macro to micro. **Gateway**
+first: *Construction Gateway* is the whole mapping, *Design Gateway* the subset
+the workbook marks `DG`. Then **authority**: picking one shows its own
+components and, under an *All authorities* heading, the ones the workbook
+assigns to `All` — those are queried by every agency, so they belong under each.
+Above the bubbles, "Only components present in model" hides everything the
+loaded model does not contain; below them, a search box filters by component or
+property name.
 
 The tool rail toggles how the un-selected remainder is drawn — ghosted, hidden,
 or normal.
@@ -157,13 +180,50 @@ Runs every mapped requirement against every matching element and reports:
 | Value not in accepted list | Outside the workbook's enumeration or Space Values list |
 | Wrong data type | Non-numeric where a Length/Area/Volume is required |
 
-The agency and discipline filters also scope the check. **Colour** paints the
+The gateway and authority bubbles also scope the check. **Colour** paints the
 whole model by each element's worst status, and clicking a component in the
 results colours its compliant and non-compliant elements against each other.
 
 Clicking any element opens an inspector showing its identity, every applicable
 IFC-SG requirement with live pass/fail, and every property set actually present —
 so a flagged value can be checked against what the model really contains.
+
+#### Value presets
+
+Your own property queries, run with the IFC values check. The CORENET X
+mapping only covers what the agencies ask for; a preset covers something
+it doesn't, like "every door on this job has `Pset_DoorCommon.FireRating` 60".
+
+A preset has two parts:
+
+- **Selector**: an IFC entity plus, optionally, one or more subtypes. A
+  subtype matches either `PredefinedType` or `ObjectType`.
+- **Condition**: a `Pset.Property` must exist, have a value, equal, not
+  equal, be one of, contain, match a pattern, or be `>` / `≥` / `<` / `≤`
+  a number.
+
+Tick **IFC values** in the Compliance tab, then **+ New preset**. With a
+model loaded, the editor fills in its suggestions from that model: the
+entities and subtypes it contains, the property sets on the selected
+elements, and the values those properties actually hold. Click a value chip
+to use it.
+
+- **Show in 3D** colours the elements that meet and don't meet the condition,
+  so you can check the preset selects the right things before you save it.
+- **By value** colours the selected elements by the property's value.
+
+In the list of saved presets, **3D** shows what a preset selects, and its
+checkbox sets whether the check runs it. After a run, each preset gets its own
+result block. Click a block to colour its passing and failing elements.
+
+Presets are saved to `data/value-presets.json` via `tools/serve.ps1`.
+Commit that file to share them with the team. On a static host, without that
+server, presets still load and run, but can't be edited.
+
+Numbers are compared in the units the model was authored in. An entity the
+ruleset doesn't cover (such as `IfcTank`) is only read from models loaded
+*after* the preset that needs it was saved, so reload any model that's already
+open.
 
 ### URA requirements
 
@@ -376,6 +436,26 @@ an updated mapping workbook:
 powershell -File tools/build-ifcsg-rules.ps1 -Xlsx "<path to the new mapping.xlsx>"
 ```
 
+Columns are found by their header text, not their position, so adding a column
+to the workbook does not break the build. If a header is renamed the script
+stops and names the column it could not find.
+
+### The Gateway column
+
+The authority workbook says nothing about which CORENET X submission gateway a
+requirement belongs to. RSP's copy adds a **Gateway** column (`DG` = Design
+Gateway, `CG` = Construction Gateway) next to *Agency*, and the build carries it
+through as `gateway` on every rule. The Queries tab groups components by it.
+
+The Construction Gateway is checked for **everything**, so a `DG` row belongs to
+both gateways and a `CG` row only to Construction. The Design Gateway is the
+subset. A row with the column blank is treated as `CG`.
+
+It is read **per row**, because the two gateways can want different things
+from the same component: for `Space (Usage)` the Design Gateway asks only for
+`SpaceName`, while the Construction Gateway asks for all 31 properties. Such a
+component appears under each gateway with that gateway's own list.
+
 ### Discipline scope
 
 The build is currently limited to the **architectural** scope — `-Disciplines`
@@ -396,7 +476,8 @@ JSON's `meta.disciplines`.
 The script reads the *CX Pilot Mapping* and *Space Values* sheets directly from
 the `.xlsx` (it copies the file first, so it works even while the workbook is open
 in Excel) and rewrites the JSON. The current build carries **407 rules / 329
-property requirements / 159 components** over 29 IFC entities, across BCA, LTA,
+property requirements / 159 components** (75 of them also at the Design
+Gateway) over 29 IFC entities, across BCA, LTA,
 NEA, NPARKS, PUB, SCDF, URA and cross-agency rows. (The full workbook holds 833
 rules; the rest are STR and MEP — see below.)
 
@@ -454,8 +535,9 @@ js/checks/                  the check framework and the checks themselves
 js/app.js                   UI wiring: models, presets, legend, checks, dashboard
 data/ifcsg-rules.json       generated ruleset (do not edit)
 data/ura-vocabulary.json    values URA accepts that the workbook lacks (hand-maintained)
+data/value-presets.json     the team's value presets (written by the app)
 tools/build-ifcsg-rules.ps1 workbook -> ruleset
-tools/serve.ps1             local static server
+tools/serve.ps1             local server: static files plus /api/presets
 ```
 
 `ifc-index.js` walks the relationship tables once at load rather than querying

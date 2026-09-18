@@ -59,11 +59,25 @@
     display: flex; align-items: center; padding: 0 12px; gap: 12px; z-index: 30;
   }
   #topbar .mark { width: 20px; height: 20px; flex-shrink: 0; }
+  /* Model picker: the model name is a button that drops down the loaded-models list. */
+  .model-picker { position: relative; min-width: 0; }
   #topbar .filename {
-    font-size: 13px; color: var(--text-muted);
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 28vw;
+    display: flex; align-items: center; gap: 7px; max-width: 28vw;
+    font-family: inherit; font-size: 13px; color: var(--text-muted);
+    background: none; border: 1px solid transparent; border-radius: var(--radius);
+    padding: 5px 8px; cursor: pointer;
   }
+  #topbar .filename .fname { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #topbar .filename .caret { font-size: 8px; opacity: .6; flex-shrink: 0; }
+  #topbar .filename:hover, .model-picker.open .filename { background: var(--panel-2); border-color: var(--border); }
   #topbar .filename.has-file { color: var(--text); }
+  .models-menu {
+    display: none; position: absolute; top: calc(100% + 6px); left: 0;
+    min-width: 320px; max-width: 46vw; max-height: 60vh; overflow-y: auto;
+    background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+    box-shadow: 0 10px 28px rgba(0, 0, 0, .5); z-index: 40;
+  }
+  .model-picker.open .models-menu { display: block; }
   #topbar .spacer { flex: 1; }
 
   .ruleset-badge {
@@ -133,8 +147,10 @@
     font-family: inherit; font-size: 12px; padding: 5px 7px; border-radius: var(--radius);
     min-width: 0;
   }
-  .filters select { flex: 1; }
   .filters input { flex: 1 1 100%; }
+  /* The one-line "present in model" toggle above the gateway bubbles. */
+  .filters-top { flex-wrap: nowrap; padding: 8px 10px; }
+  .filters-top label { white-space: nowrap; }
 
   /* Gateway / Authority bubbles: the macro -> meso filter tiers, each row
      scoped by the one(s) above it. Clicking a bubble drills the tree down. */
@@ -165,60 +181,21 @@
   .scroll::-webkit-scrollbar-thumb { background: #3c434e; border-radius: 5px; }
   .scroll::-webkit-scrollbar-track { background: transparent; }
 
-  /* Query tree: Gateway (macro) > Authority (meso) > Component (micro). */
-  .grp-head-gw {
+  /* Query sections: Components, then Properties of the chosen component. */
+  .q-head {
     display: flex; align-items: baseline; gap: 8px;
-    padding: 9px 10px 7px; font-size: 11.5px; font-weight: 600; letter-spacing: .02em;
-    color: var(--text); background: var(--panel-2);
-    border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
+    padding: 9px 10px 4px; font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase;
+    color: var(--text-muted); background: var(--panel);
+    position: sticky; top: 0; z-index: 1;
   }
-  .grp-head-gw:first-child { border-top: none; }
-  .grp-head-gw .gw-count {
-    font-weight: 400; font-size: 10.5px; color: var(--text-dim); margin-left: auto;
-  }
-
-  .grp-head {
-    padding: 7px 10px 5px 16px; font-size: 10.5px; letter-spacing: .06em;
-    color: var(--text-dim); background: var(--panel);
-    position: sticky; top: 0; border-bottom: 1px solid var(--border); z-index: 1;
-  }
-
-  .target {
-    border-bottom: 1px solid #2e333c;
-  }
-  .target-head {
-    display: flex; align-items: center; gap: 7px; padding: 7px 10px;
-    cursor: pointer; user-select: none;
-  }
-  .target-head:hover { background: var(--panel-2); }
-  .target.sel > .target-head { background: #2e4456; }
-  .target-head .caret {
-    color: var(--text-dim); font-size: 9px; width: 8px; flex-shrink: 0;
-    transition: transform .12s ease;
-  }
-  .target.open .caret { transform: rotate(90deg); }
-  .target-head .tname { flex: 1; font-size: 12.5px; min-width: 0; }
-  .target-head .tname small { display: block; color: var(--text-dim); font-size: 10.5px; }
-  .target-head .count {
-    font-size: 11px; color: var(--text-muted); font-variant-numeric: tabular-nums;
-    background: var(--panel-2); border-radius: 999px; padding: 1px 7px; flex-shrink: 0;
-  }
-  .target.zero .target-head { opacity: .42; }
-
-  .reqs { display: none; padding: 0 0 5px; }
-  .target.open .reqs { display: block; }
-  .req {
-    display: flex; align-items: center; gap: 7px;
-    padding: 5px 10px 5px 25px; cursor: pointer; font-size: 12px;
-  }
-  .req:hover { background: var(--panel-2); }
-  .req.sel { background: #2e4456; }
-  .req .rname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .req .rpset { color: var(--text-dim); font-size: 10.5px; }
-  .req .chip {
-    font-size: 9.5px; color: var(--text-dim); border: 1px solid var(--border);
-    border-radius: 2px; padding: 0 4px; flex-shrink: 0;
-  }
+  .q-head + .q-head, .bubble-row.plain + .q-head { border-top: 1px solid var(--border); margin-top: 4px; }
+  .q-head .qc { margin-left: auto; font-weight: 400; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+  .q-sub { padding: 6px 10px 1px; font-size: 10.5px; color: var(--text-dim); }
+  .bubble-row.plain { border-bottom: none; padding: 5px 10px 6px; }
+  .bubble.comp, .bubble.prop { max-width: 100%; }
+  .bubble.comp .bc, .bubble.prop .bp { overflow: hidden; text-overflow: ellipsis; }
+  .bubble.prop { font-weight: 500; }
+  .bubble.prop .bp { font-size: 10px; opacity: .55; font-weight: 400; }
 
   /* Legend */
   #legend {
@@ -247,7 +224,7 @@
   .check-actions { padding: 10px; border-bottom: 1px solid var(--border); display: flex; gap: 6px; }
 
   /* Check selection menu: which authority checks to run. */
-  .check-menu { border-bottom: 1px solid var(--border); max-height: 40%; overflow-y: auto; }
+  .check-menu { border-bottom: 1px solid var(--border); max-height: 60%; overflow-y: auto; flex-shrink: 0; }
   .cm-group { padding: 6px 0; }
   .cm-group + .cm-group { border-top: 1px solid #2e333c; }
   .cm-head {
@@ -293,6 +270,53 @@
   }
   .cm-select { cursor: pointer; }
   .cm-help { font-size: 10px; color: var(--text-dim); line-height: 1.45; margin-top: 4px; }
+
+  /* Value presets: the user's own property queries, under the IFC values check. */
+  .vp-list { border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 6px; }
+  .vp-row { display: flex; align-items: center; gap: 6px; padding: 5px 7px; }
+  .vp-row + .vp-row { border-top: 1px solid #2e333c; }
+  .vp-row.editing { background: var(--panel-2); }
+  .vp-row input { accent-color: var(--accent); flex-shrink: 0; margin: 0; }
+  .vp-text { flex: 1; min-width: 0; }
+  .vp-name { display: flex; align-items: center; gap: 5px; font-size: 11.5px; color: var(--text); }
+  .vp-text small {
+    display: block; font-size: 10px; color: var(--text-dim);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .vp-new { margin-top: 2px; }
+  .vp-warn { color: #d4a13c; }
+  .vp-form {
+    border: 1px solid var(--accent-dim); border-radius: var(--radius);
+    padding: 8px; margin-top: 4px; background: var(--panel-2);
+  }
+  .vp-title { font-size: 11.5px; color: var(--text); margin-bottom: 6px; }
+  .vp-field { display: block; margin-bottom: 6px; min-width: 0; }
+  .vp-field > span { display: block; font-size: 10.5px; color: var(--text-muted); margin-bottom: 2px; }
+  .vp-field em { font-style: normal; color: var(--text-dim); }
+  .vp-form .cm-textin, .vp-form .cm-select { background: var(--panel); }
+  .vp-pair { display: flex; gap: 6px; }
+  .vp-pair > .vp-field { flex: 1; }
+  .vp-pair > .vp-op { flex: 0 0 42%; }
+  .vp-hint { font-size: 10.5px; color: var(--text-dim); line-height: 1.45; margin: -2px 0 6px; }
+  .vp-hint:empty { display: none; }
+  .vp-values-head { color: var(--text-muted); margin-bottom: 3px; }
+  .vp-chips { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+  .vp-chip {
+    display: inline-flex; align-items: center; gap: 4px; max-width: 100%;
+    font-family: inherit; font-size: 10.5px; color: var(--text);
+    background: var(--panel); border: 1px solid var(--border); border-radius: 999px;
+    padding: 1px 7px; cursor: pointer;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .vp-chip:hover { border-color: var(--accent); }
+  .vp-chip b { font-weight: 400; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+  .vp-more { font-size: 10px; color: var(--text-dim); }
+  .vp-outcome { margin-top: 5px; font-variant-numeric: tabular-nums; }
+  .vp-error { font-size: 10.5px; color: var(--danger); margin-bottom: 6px; }
+  .vp-error:empty { display: none; }
+  .vp-actions { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+  .vp-spacer { flex: 1; }
+  .btn.vp-danger { color: #e59277; }
 
   /* Key/value facts a check reports above its findings. */
   .geo-facts {
@@ -350,9 +374,7 @@
 
   .empty-note { padding: 18px 14px; color: var(--text-dim); font-size: 12px; line-height: 1.55; }
 
-  /* ---------- Loaded models strip ---------- */
-  #models { border-bottom: 1px solid var(--border); flex-shrink: 0; max-height: 132px; overflow-y: auto; }
-  #models:empty { display: none; }
+  /* ---------- Loaded models (rows inside the top-bar picker) ---------- */
   .mrow {
     display: flex; align-items: center; gap: 7px; padding: 6px 10px;
     border-bottom: 1px solid #2e333c; font-size: 12px;
@@ -627,7 +649,12 @@
       <path d="M10 1.5L18 6v8l-8 4.5L2 14V6l8-4.5z" stroke="#4fa3d1" stroke-width="1.3" stroke-linejoin="round"/>
       <path d="M2 6l8 4.5L18 6M10 10.5V19" stroke="#4fa3d1" stroke-width="1.3" stroke-linejoin="round"/>
     </svg>
-    <span id="filename" class="filename">No model loaded</span>
+    <div class="model-picker" id="model-picker">
+      <button id="filename" class="filename" title="Loaded models">
+        <span class="fname">No model loaded</span><span class="caret">&#9660;</span>
+      </button>
+      <div id="models" class="models-menu"></div>
+    </div>
     <div class="spacer"></div>
     <div class="mem" id="mem" title="Estimated tab memory">
       <span>Memory</span>
@@ -644,7 +671,6 @@
 
   <!-- Left panel -->
   <div id="left">
-    <div id="models"></div>
     <div class="tabs">
       <button data-tab="query" class="active"><span>QUERIES</span></button>
       <button data-tab="check"><span>COMPLIANCE</span></button>
@@ -652,12 +678,13 @@
 
     <!-- Query tab -->
     <div id="tab-query" style="display:flex;flex-direction:column;flex:1;overflow:hidden;">
+      <div class="filters filters-top">
+        <label><input type="checkbox" id="f-present" checked /> Only components present in model</label>
+      </div>
       <div class="bubble-row" id="gw-bubbles"></div>
       <div class="bubble-row" id="agency-bubbles"></div>
       <div class="filters">
-        <select id="f-discipline"><option value="">All disciplines</option></select>
         <input type="search" id="f-search" placeholder="Filter component or property…" />
-        <label><input type="checkbox" id="f-present" checked /> Only components present in model</label>
       </div>
       <div class="scroll" id="tree"></div>
       <div id="legend">

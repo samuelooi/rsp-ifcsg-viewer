@@ -16,7 +16,7 @@ import { measure, project, formatBytes, LEVEL } from './memory.js';
 import {
   loadRuleset, selectElements, groupByValue, runCheck, evaluate,
   describeSubtypes, matchesTarget, formatValue, isEmptyValue,
-  STATUS, STATUS_LABEL, GATEWAY_ORDER, GATEWAY_LABEL,
+  STATUS, STATUS_LABEL, GATEWAY, GATEWAY_ORDER, GATEWAY_LABEL, AGENCY_ALL, appliesToAgency,
 } from './ifcsg.js';
 import { buildTransform } from './geo/georef.js';
 import * as registry from './checks/registry.js';
@@ -47,11 +47,21 @@ let viewer = null;
 /** modelID -> per-model index, merged into `index` for all queries. */
 const indexes = new Map();
 let index = null;
+/**
+ * modelID -> the entities the indexer was asked for when that model loaded. An
+ * entity requested later (a new value preset) is missing from models already open.
+ */
+const indexedWith = new Map();
 
 /** target.id -> element count in the loaded models. */
 const counts = new Map();
 
-let selection = null;      // { target, req }  req may be null (whole component)
+/**
+ * The active query: a component group (one agency + component, with every
+ * workbook selector that names it), and optionally one property under one of
+ * its entities. `entity` and `req` are null while the whole component is shown.
+ */
+let selection = null;      // { group, entity, req }
 let legend = [];           // [{ label, colour, elements, missing }]
 let soloIndex = -1;
 let contextMode = 'ghost'; // 'ghost' | 'hidden' | 'normal'
@@ -62,6 +72,8 @@ let checkOutcomes = [];
 let selectedChecks = new Set();
 /** "<checkId>.<inputId>" -> the value the user supplied (a string, or {name, text}). */
 const checkInputs = new Map();
+/** "<checkId>.<inputId>" -> loaded module for a `kind: 'custom'` input. */
+const customInputModules = new Map();
 let checkRunning = false;
 /** Aborts an in-flight run when the model changes or a new run starts. */
 let checkAbort = null;
@@ -71,8 +83,9 @@ let sectionDragStart = null;
 let planActive = null;     // { name, y } while a plan view is showing
 
 // Query-tree hierarchy filters, macro to micro: Gateway narrows Authority
-// narrows Component. '' means "all" at that tier.
-let gatewayFilter = '';
+// narrows Component. A gateway is always selected — Construction by default,
+// since it is checked for everything. '' means "all" for the authority tier.
+let gatewayFilter = GATEWAY.CONSTRUCTION;
 let agencyFilter = '';
 
 // Visibility policy. The viewer holds the resulting set; these two own the intent.
@@ -83,13 +96,13 @@ let spacesVisible = false;        // IfcSpace volumes obscure everything by defa
 
 const $ = (id) => document.getElementById(id);
 const el = {
-  filename: $('filename'), badge: $('ruleset-badge'),
+  filename: $('filename'), modelPicker: $('model-picker'), badge: $('ruleset-badge'),
   btnOpen: $('btn-open'), btnOpenEmpty: $('btn-open-empty'), btnReset: $('btn-reset'),
   fileInput: $('file-input'), dropzone: $('dropzone'),
   loading: $('loading'), barFill: $('bar-fill'), loadingLabel: $('loading-label'),
   toast: $('toast'), left: $('left'), models: $('models'),
   gwBubbles: $('gw-bubbles'), agencyBubbles: $('agency-bubbles'),
-  fDiscipline: $('f-discipline'), fSearch: $('f-search'), fPresent: $('f-present'),
+  fSearch: $('f-search'), fPresent: $('f-present'),
   tree: $('tree'), legend: $('legend'), legendTitle: $('legend-title'), legendRows: $('legend-rows'),
   btnClearQuery: $('btn-clear-query'),
   checkMenu: $('check-menu'),
@@ -185,6 +198,9 @@ async function init() {
     // been loaded yet still declares its entities in the registry manifest.
     for (const e of DASHBOARD_ENTITIES) ruleset.entities.add(e);
     for (const e of registry.requiredEntities()) ruleset.entities.add(e);
+    // Custom inputs can ask for entities too (a value preset on IfcTank), and
+    // those are only known once their saved data has loaded.
+    await loadCustomInputs();
 
     // The element inspector reads live pass/fail from this module, so it is
     // fetched at boot rather than on first run. It is small, and not awaiting it
@@ -194,10 +210,12 @@ async function init() {
     });
 
     el.badge.innerHTML =
-      `IFC-SG <b>${ruleset.meta.requirements}</b> rules · <b>${ruleset.targets.length}</b> components`;
+      // Construction holds every component; counting all targets would list the
+      // Design Gateway ones twice.
+      `IFC-SG <b>${ruleset.meta.requirements}</b> rules · ` +
+      `<b>${ruleset.targets.filter((t) => t.gateway === GATEWAY.CONSTRUCTION).length}</b> components`;
     el.badge.title =
       `${ruleset.meta.source}\nSheet: ${ruleset.meta.sheet}\nGenerated ${ruleset.meta.generated}`;
-    populateFilters();
     refreshFilters();
   } catch (err) {
     console.error(err);
@@ -211,11 +229,34 @@ async function init() {
   }
 }
 
-function populateFilters() {
-  for (const d of ruleset.disciplines) {
-    el.fDiscipline.insertAdjacentHTML('beforeend', `<option value="${esc(d)}">${esc(d)}</option>`);
-  }
+/** Loads every custom check input and indexes the entities they declare. */
+async function loadCustomInputs() {
+  await Promise.all(registry.customInputs().map(async ({ key, input }) => {
+    try {
+      const mod = await input.load();
+      customInputModules.set(key, mod);
+      if (typeof mod.requiredEntities === 'function') {
+        for (const e of await mod.requiredEntities()) ruleset.entities.add(String(e).toUpperCase());
+      }
+    } catch (err) {
+      // One broken input must not stop the ruleset from loading.
+      console.error(`The "${input.label}" input could not be loaded:`, err);
+    }
+  }));
+  renderCheckMenu();
 }
+
+/** What a custom check input may use. */
+const customInputApi = {
+  index: () => index,
+  isIndexed: (canon) => indexedWith.size > 0 &&
+    [...indexedWith.values()].every((set) => set.has(canon)),
+  requireEntity: (canon) => {
+    if (ruleset) ruleset.entities.add(canon);
+  },
+  showInModel: (...args) => shellActions.showInModel(...args),
+  toast,
+};
 
 // -------------------------------------------------------------------- UI wiring
 
@@ -287,9 +328,23 @@ function wireUI() {
     viewer.setWireframe(wireframe);
   });
 
-  for (const f of [el.fDiscipline, el.fPresent]) {
-    f.addEventListener('change', refreshFilters);
-  }
+  el.fPresent.addEventListener('change', refreshFilters);
+
+  // The model name drops down the loaded-models list; with nothing loaded it
+  // goes straight to the file picker instead.
+  el.filename.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (!viewer.hasModels) {
+      el.fileInput.click();
+      return;
+    }
+    el.modelPicker.classList.toggle('open');
+  });
+  el.models.addEventListener('click', (e) => e.stopPropagation());
+  document.addEventListener('click', () => el.modelPicker.classList.remove('open'));
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') el.modelPicker.classList.remove('open');
+  });
   let searchTimer;
   el.fSearch.addEventListener('input', () => {
     clearTimeout(searchTimer);
@@ -549,6 +604,7 @@ async function loadFiles(files) {
         setProgress(base + span * 0.65, `Indexing properties${label}…`);
         // Yield so the progress bar paints before the synchronous index walk.
         await new Promise((r) => setTimeout(r, 20));
+        indexedWith.set(entry.modelID, new Set(ruleset.entities));
         indexes.set(entry.modelID, buildIndex(viewer.api, entry.modelID, ruleset,
           (msg, pct) => setProgress(base + span * (0.65 + (pct / 100) * 0.34), msg + label)));
       }
@@ -590,13 +646,15 @@ function rebuildIndex() {
   }
 
   const names = viewer.entries.map((e) => e.name);
-  el.filename.textContent = names.length === 0 ? 'No model loaded'
+  el.filename.querySelector('.fname').textContent = names.length === 0 ? 'No model loaded'
     : names.length === 1 ? names[0]
       : `${names.length} models`;
   el.filename.classList.toggle('has-file', names.length > 0);
-  el.filename.title = names.join('\n');
+  el.filename.title = names.length ? names.join('\n') : 'Add an IFC file';
+  if (!names.length) el.modelPicker.classList.remove('open');
   el.btnReset.disabled = !viewer.hasModels;
-  updateRunButton();
+  // Check inputs such as the preset editor read from the index, so redraw them.
+  renderCheckMenu();
   el.btnDash.disabled = !index;
   if (!index) el.dash.classList.remove('visible');
 
@@ -647,6 +705,7 @@ function removeModel(modelID) {
     if (key.startsWith(modelID + ':')) manualHidden.delete(key);
   }
   indexes.delete(modelID);
+  indexedWith.delete(modelID);
   viewer.removeModel(modelID);
   clearQuery();
   clearCheckResults();
@@ -734,6 +793,13 @@ function openContextMenu(hit, x, y) {
     parts.push(`<button data-act="select">Show properties</button>`);
     parts.push(`<div class="sep"></div>`);
   }
+  // The elements the current query colours (a soloed legend row narrows it), so
+  // the picked-out components can be viewed on their own.
+  const queried = legend
+    .filter((g, i) => soloIndex < 0 || soloIndex === i)
+    .flatMap((g) => g.elements);
+  parts.push(`<button data-act="isolate-query"${queried.length ? '' : ' disabled'}>Isolate selected components
+    ${queried.length ? `<span class="hint">${queried.length}</span>` : ''}</button>`);
   parts.push(`<button data-act="showall"${hiddenCount ? '' : ' disabled'}>Show all
     ${hiddenCount ? `<span class="hint">${hiddenCount} hidden</span>` : ''}</button>`);
   parts.push(`<button data-act="fit">Fit view</button>`);
@@ -754,6 +820,7 @@ function openContextMenu(hit, x, y) {
         case 'hide': hideElements([item]); break;
         case 'hide-type': hideElements(index.byEntity.get(item.canonicalEntity) || []); break;
         case 'isolate': isolateElements([item]); break;
+        case 'isolate-query': isolateElements(queried); break;
         case 'select': showElement(item); break;
         case 'showall': showAll(); break;
         case 'fit': viewer.fit(); break;
@@ -768,13 +835,11 @@ function closeContextMenu() {
 
 // ------------------------------------------------------------------ query tree
 
-/** Discipline + search + "present in model" — the filters orthogonal to the hierarchy. */
+/** Search + "present in model" — the filters orthogonal to the hierarchy. */
 function matchesSecondaryFilters(t) {
-  const discipline = el.fDiscipline.value;
   const q = el.fSearch.value.trim().toLowerCase();
   const onlyPresent = el.fPresent.checked && index;
 
-  if (discipline && t.discipline !== discipline) return false;
   if (onlyPresent && !(counts.get(t.id) > 0)) return false;
   if (q) {
     const hay = [t.component, t.entity, describeSubtypes(t.subtypes),
@@ -785,10 +850,19 @@ function matchesSecondaryFilters(t) {
 }
 
 function visibleTargets() {
-  return ruleset.targets.filter((t) =>
+  const list = ruleset.targets.filter((t) =>
     (!gatewayFilter || t.gateway === gatewayFilter) &&
-    (!agencyFilter || t.agency === agencyFilter) &&
+    appliesToAgency(t, agencyFilter) &&
     matchesSecondaryFilters(t));
+  // With an authority chosen, its own components read first and the ones every
+  // authority shares follow. The sort is stable, so the order within each
+  // group is unchanged.
+  if (agencyFilter) {
+    list.sort((a, b) =>
+      GATEWAY_ORDER.indexOf(a.gateway) - GATEWAY_ORDER.indexOf(b.gateway) ||
+      (a.agency === AGENCY_ALL) - (b.agency === AGENCY_ALL));
+  }
+  return list;
 }
 
 /** Re-renders every filter-driven part of the query tab: bubbles, then the tree. */
@@ -815,10 +889,8 @@ function renderGatewayBubbles() {
   const counts_ = new Map();
   for (const t of base) counts_.set(t.gateway, (counts_.get(t.gateway) || 0) + 1);
 
-  const items = [
-    { id: '', label: 'All', n: base.length },
-    ...GATEWAY_ORDER.map((g) => ({ id: g, label: GATEWAY_LABEL[g], n: counts_.get(g) || 0 })),
-  ];
+  // No "All" here: the Construction Gateway already is everything.
+  const items = GATEWAY_ORDER.map((g) => ({ id: g, label: GATEWAY_LABEL[g], n: counts_.get(g) || 0 }));
   renderBubbles(el.gwBubbles, items, gatewayFilter, (id) => {
     gatewayFilter = id;
     // A drill-down: if the authority chosen below no longer has anything under
@@ -836,12 +908,12 @@ function renderAgencyBubbles() {
   if (!el.agencyBubbles) return;
   const base = ruleset.targets.filter((t) =>
     (!gatewayFilter || t.gateway === gatewayFilter) && matchesSecondaryFilters(t));
-  const counts_ = new Map();
-  for (const t of base) counts_.set(t.agency, (counts_.get(t.agency) || 0) + 1);
-
+  // "ALL" is not an authority but a component every authority queries, so it
+  // gets no bubble of its own and is counted under each of the others.
+  const agencies = ruleset.agencies.filter((a) => a !== AGENCY_ALL);
   const items = [
     { id: '', label: 'All', n: base.length },
-    ...ruleset.agencies.map((a) => ({ id: a, label: a, n: counts_.get(a) || 0 })),
+    ...agencies.map((a) => ({ id: a, label: a, n: base.filter((t) => appliesToAgency(t, a)).length })),
   ];
   renderBubbles(el.agencyBubbles, items, agencyFilter, (id) => {
     agencyFilter = id;
@@ -850,107 +922,230 @@ function renderAgencyBubbles() {
   });
 }
 
+// ------------------------------------------------------------ component groups
+
+/**
+ * One agency + component, with every workbook selector row that names it.
+ *
+ * The workbook lists a component once per (entity, subtypes) row, and those
+ * rows overlap — "Railing" has both IfcRailing[any] and IfcRailing[GUARDRAIL].
+ * The user thinks in components, so the rows are folded together here and the
+ * elements deduplicated, which is what makes the counts add up.
+ *
+ * @typedef {object} ComponentGroup
+ * @property {string} key       agency|component
+ * @property {string} agency
+ * @property {string} component
+ * @property {object[]} targets
+ */
+
+/** Folds targets (already scoped and ordered) into component groups. */
+function componentGroups(targets) {
+  const groups = new Map();
+  for (const t of targets) {
+    const key = t.agency + '|' + t.component;
+    let g = groups.get(key);
+    if (!g) groups.set(key, (g = { key, agency: t.agency, component: t.component, targets: [] }));
+    g.targets.push(t);
+  }
+  return [...groups.values()];
+}
+
+/** Every element any of the group's selectors matches, each once. */
+function groupElements(group) {
+  const seen = new Map();
+  for (const t of group.targets) {
+    for (const e of selectElements(index, t)) seen.set(e.key, e);
+  }
+  return [...seen.values()];
+}
+
+/**
+ * What an element is, as the modeller declared it: entity plus subtype.
+ * A USERDEFINED PredefinedType carries the real name on ObjectType.
+ */
+function elementKind(e) {
+  const pt = e.predefinedType;
+  const sub = pt && pt !== 'USERDEFINED' && pt !== 'NOTDEFINED' ? pt : (e.objectType || '');
+  return sub ? `${e.entity} · ${sub}` : e.entity;
+}
+
+/**
+ * The group's properties, grouped by the entity they apply to. A requirement
+ * that several selector rows repeat (Door: DOOR, then GATE, then the combined
+ * row) is listed once. Order follows the workbook.
+ * @returns {Array<{entity: string, canonical: string, reqs: object[]}>}
+ */
+function groupProperties(group) {
+  const byEntity = new Map();
+  for (const t of group.targets) {
+    let e = byEntity.get(t.canonicalEntity);
+    if (!e) byEntity.set(t.canonicalEntity, (e = { entity: t.entity, canonical: t.canonicalEntity, reqs: [], seen: new Set() }));
+    for (const r of t.requirements) {
+      const id = (r.pset + '|' + r.prop).toUpperCase();
+      if (e.seen.has(id)) continue;
+      e.seen.add(id);
+      e.reqs.push(r);
+    }
+  }
+  return [...byEntity.values()];
+}
+
+/** Elements of the group's `entity` selectors that carry this requirement. */
+function propertyElements(group, canonical, req) {
+  const id = (req.pset + '|' + req.prop).toUpperCase();
+  const seen = new Map();
+  for (const t of group.targets) {
+    if (t.canonicalEntity !== canonical) continue;
+    if (!t.requirements.some((r) => (r.pset + '|' + r.prop).toUpperCase() === id)) continue;
+    for (const e of selectElements(index, t)) seen.set(e.key, e);
+  }
+  return [...seen.values()];
+}
+
+// ------------------------------------------------------------------ query tree
+
+/**
+ * Two bubble sections: the components in scope, then — once one is chosen —
+ * its properties, grouped under entity labels when it spans several entities.
+ */
 function renderTree() {
   if (!ruleset) return;
-  const targets = visibleTargets();
+  const groups = componentGroups(visibleTargets());
 
-  if (!targets.length) {
-    const msg = (gatewayFilter || agencyFilter)
-      ? 'No mapped components fall under this gateway/authority selection yet — try “All”.'
+  if (!groups.length) {
+    const msg = agencyFilter
+      ? 'No mapped components fall under this gateway/authority selection yet — try “All” authorities.'
       : index ? 'No mapped components match these filters.'
               : 'Load an IFC model, or untick “Only components present in model”.';
     el.tree.innerHTML = `<div class="empty-note">${msg}</div>`;
     return;
   }
 
-  const parts = [];
-  let gateway = null;
+  const active = selection ? selection.group.key : null;
+  const parts = [`<div class="q-head">Components<span class="qc">${groups.length}</span></div>`];
   let agency = null;
-  for (const t of targets) {
-    if (t.gateway !== gateway) {
-      gateway = t.gateway;
-      agency = null; // force the authority header to re-print under the new gateway
-      const n = targets.filter((x) => x.gateway === gateway).length;
-      parts.push(`<div class="grp-head-gw">${esc(GATEWAY_LABEL[gateway])}<span class="gw-count">${n}</span></div>`);
+  let row = [];
+  const flush = () => {
+    if (row.length) parts.push(`<div class="bubble-row plain">${row.join('')}</div>`);
+    row = [];
+  };
+  for (const g of groups) {
+    if (g.agency !== agency) {
+      flush();
+      agency = g.agency;
+      const label = agency === AGENCY_ALL
+        ? (agencyFilter ? 'All authorities (incl. ' + agencyFilter + ')' : 'All authorities')
+        : agency;
+      parts.push(`<div class="q-sub">${esc(label)}</div>`);
     }
-    if (t.agency !== agency) {
-      agency = t.agency;
-      parts.push(`<div class="grp-head">${esc(agency)}</div>`);
-    }
-    const n = index ? counts.get(t.id) || 0 : null;
-    const open = selection && selection.target.id === t.id;
-    parts.push(`
-      <div class="target${open ? ' open sel' : ''}${n === 0 ? ' zero' : ''}" data-t="${t.id}">
-        <div class="target-head" data-act="target">
-          <span class="caret">&#9654;</span>
-          <span class="tname">${esc(t.component)}
-            <small>${esc(t.entity)} · ${esc(describeSubtypes(t.subtypes))}</small>
-          </span>
-          ${n === null ? '' : `<span class="count">${n}</span>`}
-        </div>
-        <div class="reqs">${t.requirements.map((r, i) => `
-          <div class="req${open && selection.req === r ? ' sel' : ''}" data-r="${i}">
-            <span class="rname">${esc(r.prop)}<span class="rpset"> · ${esc(r.pset)}</span></span>
-            ${r.accepted.kind === 'enum' ? '<span class="chip">list</span>' : ''}
-            ${r.accepted.kind === 'spaceValues' ? '<span class="chip">SV</span>' : ''}
-            ${r.unit ? `<span class="chip">${esc(r.unit)}</span>` : ''}
-          </div>`).join('')}
-        </div>
-      </div>`);
+    const n = index ? groupElements(g).length : null;
+    const title = g.targets.map((t) => `${t.entity} · ${describeSubtypes(t.subtypes)}`).join('\n');
+    row.push(`<button class="bubble comp${g.key === active ? ' active' : ''}${n === 0 ? ' zero' : ''}"
+      data-g="${esc(g.key)}" title="${esc(title)}">${esc(g.component)}${
+        n === null ? '' : `<span class="bc">${n}</span>`}</button>`);
   }
+  flush();
+
+  if (selection) {
+    const group = selection.group;
+    const entities = groupProperties(group);
+    const total = entities.reduce((s, e) => s + e.reqs.length, 0);
+    parts.push(`<div class="q-head">Properties · ${esc(group.component)}<span class="qc">${total}</span></div>`);
+    if (!total) {
+      parts.push('<div class="empty-note">The mapping lists no properties for this component — it only declares which elements belong to it.</div>');
+    }
+    for (const e of entities) {
+      if (!e.reqs.length) continue;
+      if (entities.length > 1) parts.push(`<div class="q-sub">${esc(e.entity)}</div>`);
+      parts.push(`<div class="bubble-row plain">${e.reqs.map((r, i) => {
+        const on = selection.req && selection.entity === e.canonical &&
+          (selection.req.pset + selection.req.prop).toUpperCase() === (r.pset + r.prop).toUpperCase();
+        const hint = [r.pset, r.dataType, r.unit,
+          r.accepted.kind === 'enum' ? 'accepted: ' + r.accepted.values.join(', ') : '',
+          r.accepted.kind === 'spaceValues' ? 'Space Values list' : ''].filter(Boolean).join('\n');
+        return `<button class="bubble prop${on ? ' active' : ''}" data-e="${esc(e.canonical)}" data-r="${i}"
+          title="${esc(hint)}">${esc(r.prop)}<span class="bp">${esc(r.pset)}</span></button>`;
+      }).join('')}</div>`);
+    }
+  }
+
   el.tree.innerHTML = parts.join('');
 
-  el.tree.querySelectorAll('.target').forEach((node) => {
-    const target = ruleset.targets.find((t) => t.id === node.dataset.t);
-    node.querySelector('.target-head').addEventListener('click', () => {
-      if (selection && selection.target.id === target.id && !selection.req) clearQuery();
-      else selectQuery(target, null);
-    });
-    node.querySelectorAll('.req').forEach((rnode) => {
-      rnode.addEventListener('click', (e) => {
-        e.stopPropagation();
-        selectQuery(target, target.requirements[+rnode.dataset.r]);
-      });
+  el.tree.querySelectorAll('.bubble.comp').forEach((b) => {
+    const g = groups.find((x) => x.key === b.dataset.g);
+    b.addEventListener('click', () => {
+      if (selection && selection.group.key === g.key && !selection.req) clearQuery();
+      else selectComponent(g);
     });
   });
+  if (selection) {
+    const entities = groupProperties(selection.group);
+    el.tree.querySelectorAll('.bubble.prop').forEach((b) => {
+      const e = entities.find((x) => x.canonical === b.dataset.e);
+      b.addEventListener('click', () => selectProperty(selection.group, e.canonical, e.reqs[+b.dataset.r]));
+    });
+  }
 }
 
 // ---------------------------------------------------------------- query / colour
 
-function selectQuery(target, req) {
+/** Colours a component's elements by what each one is: entity plus subtype. */
+function selectComponent(group) {
   if (!index) {
     toast('Load an IFC model first.');
     return;
   }
-  const elements = selectElements(index, target);
+  const elements = groupElements(group);
   if (!elements.length) {
-    toast(`No ${target.entity} elements in the loaded models match ${target.component}.`);
+    toast(`No elements in the loaded models match ${group.component}.`);
     return;
   }
-
   // Querying spaces while spaces are hidden would colour nothing; the request to
   // see them is explicit, so honour it and let the toggle reflect the change.
-  if (target.canonicalEntity === 'IFCSPACE' && !spacesVisible) setSpacesVisible(true);
+  if (elements.some((e) => e.canonicalEntity === 'IFCSPACE') && !spacesVisible) setSpacesVisible(true);
 
-  selection = { target, req };
+  selection = { group, entity: null, req: null };
   soloIndex = -1;
 
-  if (req) {
-    const groups = groupByValue(elements, req);
-    let ci = 0;
-    legend = groups.map((g) => ({
-      label: g.label,
-      colour: g.missing ? MISSING_COLOUR : PALETTE[ci++ % PALETTE.length],
-      elements: g.elements,
-      missing: g.missing,
-    }));
-    el.legendTitle.innerHTML =
-      `${esc(req.prop)}<small>${esc(target.component)} · ${esc(req.pset)} · ${elements.length} elements</small>`;
-  } else {
-    legend = [{ label: target.component, colour: SINGLE_COLOUR, elements, missing: false }];
-    el.legendTitle.innerHTML =
-      `${esc(target.component)}<small>${esc(target.entity)} · ${elements.length} elements</small>`;
+  const kinds = new Map();
+  for (const e of elements) {
+    const k = elementKind(e);
+    if (!kinds.has(k)) kinds.set(k, []);
+    kinds.get(k).push(e);
   }
+  legend = [...kinds.entries()]
+    .sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]))
+    .map(([label, els], i) => ({ label, colour: PALETTE[i % PALETTE.length], elements: els, missing: false }));
+  el.legendTitle.innerHTML =
+    `${esc(group.component)}<small>${esc(group.agency)} · ${elements.length} elements · ${kinds.size} kind${kinds.size === 1 ? '' : 's'}</small>`;
+
+  renderTree();
+  renderLegend();
+  applyOverlay();
+}
+
+/** Colours the elements one property applies to by that property's value. */
+function selectProperty(group, canonical, req) {
+  const elements = propertyElements(group, canonical, req);
+  if (!elements.length) {
+    toast(`No elements in the loaded models carry ${req.pset}.${req.prop} under ${group.component}.`);
+    return;
+  }
+  if (canonical === 'IFCSPACE' && !spacesVisible) setSpacesVisible(true);
+
+  selection = { group, entity: canonical, req };
+  soloIndex = -1;
+
+  let ci = 0;
+  legend = groupByValue(elements, req).map((g) => ({
+    label: g.label,
+    colour: g.missing ? MISSING_COLOUR : PALETTE[ci++ % PALETTE.length],
+    elements: g.elements,
+    missing: g.missing,
+  }));
+  el.legendTitle.innerHTML =
+    `${esc(req.prop)}<small>${esc(group.component)} · ${esc(req.pset)} · ${elements.length} elements</small>`;
 
   renderTree();
   renderLegend();
@@ -1159,7 +1354,12 @@ function renderCheckInputs(check) {
     const key = check.id + '.' + input.id;
     const held = checkInputs.get(key);
     let control;
-    if (input.kind === 'file') {
+    if (input.kind === 'custom') {
+      // Filled by the input's own module once the menu is in the page.
+      control = `<div class="cm-custom" data-custom="${esc(key)}">
+           <div class="cm-help">Loading…</div>
+         </div>`;
+    } else if (input.kind === 'file') {
       control = `<div class="cm-file">
            <button class="btn sm" data-pick="${esc(key)}">Choose file</button>
            <input type="file" data-file="${esc(key)}" accept="${esc(input.accept || '')}" hidden />
@@ -1186,6 +1386,15 @@ function renderCheckInputs(check) {
 }
 
 function wireCheckInputs() {
+  el.checkMenu.querySelectorAll('[data-custom]').forEach((host) => {
+    const mod = customInputModules.get(host.dataset.custom);
+    if (!mod) return;
+    Promise.resolve(mod.mount(host, customInputApi)).catch((err) => {
+      console.error(err);
+      host.innerHTML = '<div class="cm-help">This input could not be shown — see the browser console.</div>';
+    });
+  });
+
   el.checkMenu.querySelectorAll('[data-pick]').forEach((btn) => {
     btn.addEventListener('click', (e) => {
       e.preventDefault();
@@ -1243,6 +1452,11 @@ function inputsFor(checkId) {
   const meta = registry.byId(checkId);
   const out = {};
   for (const input of (meta && meta.inputs) || []) {
+    if (input.kind === 'custom') {
+      const mod = customInputModules.get(checkId + '.' + input.id);
+      if (mod) out[input.id] = mod.value();
+      continue;
+    }
     const held = checkInputs.get(checkId + '.' + input.id);
     // A select the user never touched still has the value the menu is showing.
     if (held !== undefined) out[input.id] = held;
@@ -1264,35 +1478,68 @@ function updateRunButton() {
 async function doRunCheck() {
   if (!index || !ruleset || !selectedChecks.size || checkRunning) return;
 
-  const discipline = el.fDiscipline.value;
+  const ids = registry.all().map((c) => c.id).filter((id) => selectedChecks.has(id));
 
-  el.btnRunCheck.disabled = true;
-  el.btnRunCheck.textContent = 'Checking…';
+  if (checkAbort) checkAbort.abort();
+  checkAbort = new AbortController();
 
-  setTimeout(() => {
-    try {
-      checkResult = runCheck(index, ruleset, (t) =>
-        (!gatewayFilter || t.gateway === gatewayFilter) &&
-        (!agencyFilter || t.agency === agencyFilter) &&
-        (!discipline || t.discipline === discipline));
-      renderSummary();
-      renderIssues();
-      el.btnColourStatus.disabled = false;
-    } catch (err) {
-      console.error(err);
-      toast('The compliance check failed — see the browser console.');
-    } finally {
-      el.btnRunCheck.disabled = false;
-      el.btnRunCheck.textContent = 'Run compliance check';
+  checkRunning = true;
+  updateRunButton();
+  el.issues.innerHTML = '<div class="empty-note">Running…</div>';
+
+  const ctx = {
+    index,
+    ruleset,
+    modelNames: new Map(viewer.entries.map((e) => [e.modelID, e.name])),
+    filter: (t) =>
+      (!gatewayFilter || t.gateway === gatewayFilter) &&
+      appliesToAgency(t, agencyFilter),
+    signal: checkAbort.signal,
+    progress: () => {},
+    inputsFor,
+    // The submitted files themselves, for the checks that are about the
+    // submission rather than about the building.
+    files: viewer.entries.map((e) => ({ modelID: e.modelID, name: e.name, bytes: e.bytes })),
+    // Where the model sits, and what it is made of — needed by checks that ask
+    // about position rather than properties.
+    coordinationMatrix: viewer.coordinationMatrix,
+    geometry: {
+      // Hulls rather than raw points: the affine transform to survey
+      // coordinates preserves convexity, so hulling in scene space first is
+      // both exact and far cheaper than transforming millions of vertices.
+      elementHull: (elements) => viewer.elementHull(elements),
+      modelHull: () => viewer.modelHull(),
+      groundLevel: () => viewer.groundLevel(),
+    },
+  };
+
+  try {
+    checkOutcomes = await runChecks(ids, ctx, (msg) => {
+      el.issues.innerHTML = `<div class="empty-note">${esc(msg)}</div>`;
+    });
+    renderSummary();
+    renderCheckResults();
+    renderCheckMenu();
+    el.btnColourStatus.disabled = !checkOutcomes.some((o) => o.result);
+
+    const broken = checkOutcomes.filter((o) => o.error);
+    if (broken.length) {
+      toast(`${broken.length} check${broken.length > 1 ? 's' : ''} could not run — see the browser console.`);
     }
-  }, 20);
+  } catch (err) {
+    console.error(err);
+    toast('The compliance check failed — see the browser console.');
+  } finally {
+    checkRunning = false;
+    updateRunButton();
+  }
 }
 
 /** Headline numbers across every check that ran. */
 function renderSummary() {
   const t = totalsOf(checkOutcomes);
   const pct = t.assertions ? Math.round((t.pass / t.assertions) * 100) : 0;
-  const scope = [gatewayFilter && GATEWAY_LABEL[gatewayFilter], agencyFilter, el.fDiscipline.value]
+  const scope = [gatewayFilter && GATEWAY_LABEL[gatewayFilter], agencyFilter]
     .filter(Boolean).join(' · ') || 'All gateways';
   const names = checkOutcomes.filter((o) => o.result).map((o) => o.meta.title).join(', ');
 

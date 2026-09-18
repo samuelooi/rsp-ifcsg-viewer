@@ -43,56 +43,55 @@ const eq = (a, b) =>
   a != null && b != null && String(a).trim().toUpperCase() === String(b).trim().toUpperCase();
 
 // ---------------------------------------------------------------------------
+// Agencies
+// ---------------------------------------------------------------------------
+
+/**
+ * The workbook's "All" agency: a component every authority queries, rather
+ * than an authority of its own. Upper-cased by the build like every agency.
+ */
+export const AGENCY_ALL = 'ALL';
+
+/** Does a target fall under an authority filter? '' means any authority. */
+export function appliesToAgency(target, agency) {
+  return !agency || target.agency === agency || target.agency === AGENCY_ALL;
+}
+
+// ---------------------------------------------------------------------------
 // CX submission gateway
 // ---------------------------------------------------------------------------
 
 /**
- * Which CORENET X submission gateway a component belongs to.
+ * Which CORENET X submission gateway a requirement belongs to.
  *
- * This is not part of the authority-issued mapping workbook — there is no such
- * column — so it is sourced separately from data/gateway-map.json (see that
- * file for how to fill it in) rather than requiring the workbook to be edited
- * and regenerated just to classify a component.
+ * The authority workbook has no such column; RSP adds a "Gateway" column
+ * (DG / CG) to its copy, and tools/build-ifcsg-rules.ps1 carries it through as
+ * `rule.gateway`. The Construction Gateway is checked for everything, so a row
+ * marked DG belongs to both gateways and a row marked CG only to Construction.
+ * It is per row: within one component the Design Gateway can ask for fewer
+ * properties, so a component is indexed as one target per gateway.
  */
 export const GATEWAY = {
   DESIGN: 'design',
   CONSTRUCTION: 'construction',
-  UNCLASSIFIED: 'unclassified',
 };
 
 export const GATEWAY_LABEL = {
   [GATEWAY.DESIGN]: 'Design Gateway',
   [GATEWAY.CONSTRUCTION]: 'Construction Gateway',
-  [GATEWAY.UNCLASSIFIED]: 'Unclassified',
 };
 
-/** Macro-to-micro display order: classified gateways first, unclassified last. */
-export const GATEWAY_ORDER = [GATEWAY.DESIGN, GATEWAY.CONSTRUCTION, GATEWAY.UNCLASSIFIED];
-
-/** Case-insensitive property lookup — the map is hand-edited, so casing may drift. */
-function ciGet(obj, key) {
-  if (!obj || key == null) return undefined;
-  if (key in obj) return obj[key];
-  const found = Object.keys(obj).find((k) => k.toLowerCase() === String(key).toLowerCase());
-  return found === undefined ? undefined : obj[found];
-}
+/** Display order, the stricter gateway last. */
+export const GATEWAY_ORDER = [GATEWAY.DESIGN, GATEWAY.CONSTRUCTION];
 
 /**
- * A target's gateway, via data/gateway-map.json: byAgencyComponent[agency][component]
- * (the map's structure follows the Excel — agency, then component, matching the UI's
- * Gateway -> Authority -> Component hierarchy), then byAgency[agency], then default.
+ * The gateways a workbook row belongs to. A row with the column blank is
+ * treated as CG: the authorities check everything at the Construction Gateway.
  */
-function resolveGateway(target, map) {
-  if (!map) return GATEWAY.UNCLASSIFIED;
-
-  const agencyBucket = ciGet(map.byAgencyComponent, target.agency);
-  const direct = ciGet(agencyBucket, target.component);
-  if (direct) return direct;
-
-  const agencyFallback = ciGet(map.byAgency, target.agency);
-  if (agencyFallback) return agencyFallback;
-
-  return map.default || GATEWAY.UNCLASSIFIED;
+function gatewaysOf(rule) {
+  return rule.gateway === GATEWAY.DESIGN
+    ? [GATEWAY.DESIGN, GATEWAY.CONSTRUCTION]
+    : [GATEWAY.CONSTRUCTION];
 }
 
 // ---------------------------------------------------------------------------
@@ -110,16 +109,13 @@ async function fetchOptionalJson(url) {
 }
 
 /**
- * Loads and indexes the generated ruleset, plus two optional side files: the
- * URA vocabulary overlay and the hand-maintained gateway map. If either is
- * missing, the workbook's own lists still apply and every component reads as
- * "Unclassified" instead of the app breaking.
+ * Loads and indexes the generated ruleset, plus the optional URA vocabulary
+ * overlay. If the overlay is missing, the workbook's own lists still apply.
  * @returns {Promise<Ruleset>}
  */
 export async function loadRuleset(
   url = 'data/ifcsg-rules.json',
   overlayUrl = 'data/ura-vocabulary.json',
-  gatewayUrl = 'data/gateway-map.json',
 ) {
   const res = await fetch(url, { cache: 'no-cache' });
   if (!res.ok) throw new Error(`Could not load the IFC-SG ruleset (${res.status} ${res.statusText}).`);
@@ -127,13 +123,9 @@ export async function loadRuleset(
   // The agencies publish vocabulary in more than one place and the lists do not
   // always agree. The overlay carries what URA accepts but the workbook does
   // not, so a value the authority would pass is not reported here as invalid.
-  const [raw, overlay, gatewayMap] = await Promise.all([
-    res.json(),
-    fetchOptionalJson(overlayUrl),
-    fetchOptionalJson(gatewayUrl),
-  ]);
+  const [raw, overlay] = await Promise.all([res.json(), fetchOptionalJson(overlayUrl)]);
 
-  return indexRuleset(raw, overlay, gatewayMap);
+  return indexRuleset(raw, overlay);
 }
 
 /**
@@ -170,12 +162,14 @@ function mergeVocabulary(spaceValues, overlay) {
 /**
  * Groups the flat rule rows into the component-level structure the UI presents.
  *
- * A "target" is one (agency, component, entity, subtypes) selector — the thing a
- * query isolates. Its requirements are the property rows the mapping attaches to
- * it. The workbook splits one component across several rows with identical
- * selectors, so rows are keyed by selector identity to recombine them.
+ * A "target" is one (gateway, agency, component, entity, subtypes) selector —
+ * the thing a query isolates. Its requirements are the property rows the
+ * mapping attaches to it. The workbook splits one component across several
+ * rows with identical selectors, so rows are keyed by selector identity to
+ * recombine them. Gateway is part of that identity: the Design Gateway can ask
+ * for a subset of a component's properties, and that subset is its own target.
  */
-export function indexRuleset(raw, overlay = null, gatewayMap = null) {
+export function indexRuleset(raw, overlay = null) {
   const spaceValues = raw.spaceValues || {};
   const vocabulary = mergeVocabulary(spaceValues, overlay);
 
@@ -185,30 +179,32 @@ export function indexRuleset(raw, overlay = null, gatewayMap = null) {
     // Subtype lists are per-row; the selector identity includes them so that,
     // e.g., IfcDamper/SMOKEDAMPER and IfcDamper/FIRESMOKEDAMPER stay distinct.
     const subKey = rule.subtypes.map((s) => (s.anySubtype ? '*' : (s.userDefined ? '*' : '') + s.value)).sort().join(',');
-    const key = [rule.agency, rule.component, rule.entity, subKey].join('\u0000');
+    for (const gateway of gatewaysOf(rule)) {
+      const key = [gateway, rule.agency, rule.component, rule.entity, subKey].join('\u0000');
 
-    let target = targets.get(key);
-    if (!target) {
-      target = {
-        id: 't' + targets.size,
-        agency: rule.agency,
-        component: rule.component,
-        discipline: rule.discipline,
-        entity: rule.entity,
-        canonicalEntity: canonicalEntity(rule.entity),
-        subtypes: rule.subtypes,
-        requirements: [],
-      };
-      targets.set(key, target);
+      let target = targets.get(key);
+      if (!target) {
+        target = {
+          id: 't' + targets.size,
+          gateway,
+          agency: rule.agency,
+          component: rule.component,
+          discipline: rule.discipline,
+          entity: rule.entity,
+          canonicalEntity: canonicalEntity(rule.entity),
+          subtypes: rule.subtypes,
+          requirements: [],
+        };
+        targets.set(key, target);
+      }
+      if (rule.kind === 'requirement') target.requirements.push(rule);
     }
-    if (rule.kind === 'requirement') target.requirements.push(rule);
   }
 
   const targetList = [...targets.values()];
   for (const t of targetList) {
     t.requirements.sort((a, b) =>
       (a.pset + a.prop).localeCompare(b.pset + b.prop, undefined, { sensitivity: 'base' }));
-    t.gateway = resolveGateway(t, gatewayMap);
   }
   targetList.sort((a, b) =>
     GATEWAY_ORDER.indexOf(a.gateway) - GATEWAY_ORDER.indexOf(b.gateway) ||
@@ -316,7 +312,20 @@ export function formatValue(v) {
   if (v === true) return 'True';
   if (v === false) return 'False';
   if (v === null || v === undefined) return '';
+  if (typeof v === 'number') return formatNumber(v);
+  // Exporters sometimes write numbers as text, noise included.
+  if (typeof v === 'string' && /^\s*-?\d+\.\d{7,}\s*$/.test(v)) return formatNumber(Number(v));
   return String(v);
+}
+
+/**
+ * A number as the modeller typed it. Float arithmetic in exporters leaves
+ * 1800.0000000000002 where 1800 was drawn; rounding to three decimals removes
+ * that noise while keeping genuine precision such as 0.125.
+ */
+export function formatNumber(n) {
+  if (!Number.isFinite(n)) return String(n);
+  return String(Math.round(n * 1000) / 1000);
 }
 
 /** True when a property carries no usable value. `false` is a value, not a gap. */
@@ -471,9 +480,14 @@ export function groupByValue(elements, req) {
     }
     g.elements.push(el);
   }
-  // Largest buckets first, but always keep "(not set)" last so it reads as the exception.
-  return [...groups.values()].sort((a, b) => {
+  // Ascending by value — numerically when every value is a number, otherwise
+  // alphabetically with embedded numbers in order (B2 before B10). "(not set)"
+  // always comes last so it reads as the exception.
+  const list = [...groups.values()];
+  const numeric = list.every((g) => g.missing || Number.isFinite(Number(g.label)));
+  return list.sort((a, b) => {
     if (a.missing !== b.missing) return a.missing ? 1 : -1;
-    return b.elements.length - a.elements.length || a.label.localeCompare(b.label);
+    if (numeric) return Number(a.label) - Number(b.label);
+    return a.label.localeCompare(b.label, undefined, { numeric: true, sensitivity: 'base' });
   });
 }
