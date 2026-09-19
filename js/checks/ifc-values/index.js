@@ -173,6 +173,8 @@ const module = {
           value: isEmptyValue(r.value) ? '—' : formatValue(r.value),
           colour: STATUS_COLOUR[r.status],
           rule: target.agency + ' · ' + target.component,
+          // The requirement itself, so the inspector can offer to fix the gap.
+          req,
         });
       }
     }

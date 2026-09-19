@@ -12,9 +12,9 @@
 import { Viewer } from './viewer.js';
 import { buildIndex, mergeIndexes } from './ifc-index.js';
 import { DASHBOARD_ENTITIES, computeDashboard, formatValue as fmtNum } from './dashboard.js';
-import { measure, project, formatBytes, LEVEL } from './memory.js';
+import { measure, project as projectMemory, formatBytes, LEVEL } from './memory.js';
 import {
-  loadRuleset, selectElements, groupByValue, runCheck, evaluate,
+  loadRuleset, selectElements, groupByValue, runCheck, evaluate, getValue,
   describeSubtypes, matchesTarget, formatValue, isEmptyValue,
   STATUS, STATUS_LABEL, GATEWAY, GATEWAY_ORDER, GATEWAY_LABEL, AGENCY_ALL, appliesToAgency,
 } from './ifcsg.js';
@@ -25,6 +25,25 @@ import {
   SEVERITY, SEVERITY_LABEL, SEVERITY_COLOUR, SEVERITY_ORDER, worstOf,
 } from './checks/severity.js';
 import { esc, hex } from './util/dom.js';
+import {
+  FORMAT as PROJECT_FORMAT, VERSION as PROJECT_VERSION, emptyProject, parseProject,
+  looksLikeProjectFile, fingerprint, labelOf, saveToDisk, openFromDisk,
+  recentProjects, rememberProject, forgetRecent, lastProject, clearLastProject,
+} from './project.js';
+import {
+  loadPresets, currentPresets, enabledPresets, savePresets, canSave,
+} from './checks/ifc-values/preset-store.js';
+import * as WebIFC from 'web-ifc';
+import { WASM_PATH } from './viewer.js';
+import { scanFile } from './ifc-text.js';
+import { IfcEditor } from './ifc-edit/editor.js';
+import {
+  readBcf, writeBcf, newTopic, newComment, newViewpoint, touch as touchTopic,
+} from './bcf/bcf.js';
+import { buildReadinessReport } from './report/report.js';
+import {
+  readHeader, buildIdentity, bestMatch, compareRevision, describeIdentity, MATCH,
+} from './model-id.js';
 
 // ---------------------------------------------------------------------- colours
 
@@ -46,6 +65,8 @@ let viewer = null;
 
 /** modelID -> per-model index, merged into `index` for all queries. */
 const indexes = new Map();
+/** modelID -> what that file *is* (see model-id.js), read from its header and spatial ids. */
+const identities = new Map();
 let index = null;
 /**
  * modelID -> the entities the indexer was asked for when that model loaded. An
@@ -117,6 +138,14 @@ const el = {
   btnDash: $('btn-dash'), dash: $('dash'), dashBody: $('dash-body'),
   dashSub: $('dash-sub'), dashSeg: $('dash-seg'), dashClose: $('dash-close'),
   mem: $('mem'), memFill: $('mem-fill'), memVal: $('mem-val'),
+  projectPicker: $('project-picker'), projectChip: $('project-chip'), projectPanel: $('project-panel'),
+  startProjects: $('start-projects'),
+  btnSetValue: $('btn-set-value'), legendEdit: $('legend-edit'),
+  editsBar: $('edits-bar'), editsText: $('edits-text'),
+  btnDiscardEdits: $('btn-discard-edits'), btnExportIfc: $('btn-export-ifc'),
+  btnToBcf: $('btn-to-bcf'), btnReport: $('btn-report'), btnBcfImport: $('btn-bcf-import'), btnBcfNew: $('btn-bcf-new'),
+  btnBcfExport: $('btn-bcf-export'), bcfInput: $('bcf-input'), bcfAuthor: $('bcf-author'),
+  bcfList: $('bcf-list'), bcfDetail: $('bcf-detail'),
 };
 
 /** Which breakdown the dashboard cards show: 'level' | 'file' | 'none'. */
@@ -216,6 +245,7 @@ async function init() {
     el.badge.title =
       `${ruleset.meta.source}\nSheet: ${ruleset.meta.sheet}\nGenerated ${ruleset.meta.generated}`;
     refreshFilters();
+    await restoreLastProject();
   } catch (err) {
     console.error(err);
     el.badge.textContent = 'Ruleset failed to load';
@@ -283,9 +313,20 @@ function wireUI() {
     e.preventDefault();
     el.dropzone.classList.remove('dragover');
     if (viewer.hasModels) el.dropzone.classList.remove('visible');
+    // A project file can ride along with the IFCs, or arrive on its own. It is
+    // applied first so the gateway and check selection are in place before the
+    // models index.
     const files = [...e.dataTransfer.files];
-    if (files.length) loadFiles(files);
+    const isBcf = (f) => /\.(bcf|bcfzip)$/i.test(f.name);
+    const projects = files.filter((f) => looksLikeProjectFile(f.name));
+    const bcfs = files.filter(isBcf);
+    const models = files.filter((f) => !looksLikeProjectFile(f.name) && !isBcf(f));
+    if (projects.length) openProjectFile(projects[0]);
+    for (const f of bcfs) importBcfFile(f);
+    if (models.length) loadFiles(models);
   });
+
+  wireProjectUI();
 
   el.panelClose.addEventListener('click', () => el.panel.classList.remove('visible'));
   el.btnReset.addEventListener('click', () => viewer.fit());
@@ -356,14 +397,16 @@ function wireUI() {
     b.addEventListener('click', () => {
       document.querySelectorAll('.tabs button').forEach((x) => x.classList.remove('active'));
       b.classList.add('active');
-      const tab = b.dataset.tab;
-      $('tab-query').style.display = tab === 'query' ? 'flex' : 'none';
-      $('tab-check').style.display = tab === 'check' ? 'flex' : 'none';
+      showTab(b.dataset.tab);
     });
   });
 
   el.btnRunCheck.addEventListener('click', doRunCheck);
   el.btnColourStatus.addEventListener('click', colourByStatus);
+  el.btnToBcf.addEventListener('click', findingsToBcf);
+  el.btnReport.addEventListener('click', makeReport);
+  wireEditingUI();
+  wireBcfUI();
 
   el.btnDash.addEventListener('click', openDashboard);
   el.dashClose.addEventListener('click', () => el.dash.classList.remove('visible'));
@@ -591,7 +634,7 @@ async function loadFiles(files) {
   // Warn before parsing: a parse cannot be interrupted, and a file that does
   // not fit takes the whole tab down with it. The user can still go ahead.
   const now = measure(viewer);
-  const forecast = project(now, ifcFiles);
+  const forecast = projectMemory(now, ifcFiles);
   if (forecast.level === LEVEL.DANGER) {
     toast(`${formatBytes(forecast.fileBytes)} of IFC is expected to need about ` +
       `${formatBytes(forecast.peak)} of memory against a ${formatBytes(now.budget)} budget. ` +
@@ -623,6 +666,18 @@ async function loadFiles(files) {
         indexes.set(entry.modelID, buildIndex(viewer.api, entry.modelID, ruleset,
           (msg, pct) => setProgress(base + span * (0.65 + (pct / 100) * 0.34), msg + label)));
       }
+      // What this file *is*, independent of what it is called: the header plus
+      // the spatial GlobalIds. Read now, while the index for this one model is
+      // to hand and before it is merged with the others.
+      try {
+        const header = await readHeader(file);
+        identities.set(entry.modelID, buildIdentity(header, indexes.get(entry.modelID), {
+          name: entry.name, bytes: entry.bytes,
+        }));
+      } catch (err) {
+        console.warn(`Could not read the header of ${file.name}:`, err);
+      }
+
       // Everything the mapping needs is now in the index, and nothing after this
       // reads the wasm model — so hand that memory back before the next file.
       viewer.releaseModelData(entry.modelID);
@@ -721,6 +776,13 @@ function removeModel(modelID) {
   }
   indexes.delete(modelID);
   indexedWith.delete(modelID);
+  identities.delete(modelID);
+  if (editors.has(modelID) && editors.get(modelID).hasEdits) {
+    toast(`Unsaved edits to ${viewer.models.get(modelID)?.name || 'the model'} were dropped with it.`);
+  }
+  editors.delete(modelID);
+  textScans.delete(modelID);
+  renderEditsBar();
   viewer.removeModel(modelID);
   clearQuery();
   clearCheckResults();
@@ -864,10 +926,19 @@ function matchesSecondaryFilters(t) {
   return true;
 }
 
+/**
+ * Does a target fall inside the project's authority scope and the query tab's
+ * authority filter? A project listing no authorities scopes nothing out.
+ */
+function inScope(t) {
+  if (!appliesToAgency(t, agencyFilter)) return false;
+  return !projectAuthorities || t.agency === AGENCY_ALL || projectAuthorities.has(t.agency);
+}
+
 function visibleTargets() {
   const list = ruleset.targets.filter((t) =>
     (!gatewayFilter || t.gateway === gatewayFilter) &&
-    appliesToAgency(t, agencyFilter) &&
+    inScope(t) &&
     matchesSecondaryFilters(t));
   // With an authority chosen, its own components read first and the ones every
   // authority shares follow. The sort is stable, so the order within each
@@ -885,6 +956,7 @@ function refreshFilters() {
   renderGatewayBubbles();
   renderAgencyBubbles();
   renderTree();
+  renderProjectChip();
 }
 
 /** One row of pill filters: `items` is [{id, label, n}], id '' is the "all" bubble. */
@@ -907,25 +979,38 @@ function renderGatewayBubbles() {
   // No "All" here: the Construction Gateway already is everything.
   const items = GATEWAY_ORDER.map((g) => ({ id: g, label: GATEWAY_LABEL[g], n: counts_.get(g) || 0 }));
   renderBubbles(el.gwBubbles, items, gatewayFilter, (id) => {
-    gatewayFilter = id;
-    // A drill-down: if the authority chosen below no longer has anything under
-    // this gateway, drop back to "all authorities" rather than showing nothing.
-    if (agencyFilter && !ruleset.targets.some((t) =>
-      t.agency === agencyFilter && (!gatewayFilter || t.gateway === gatewayFilter) && matchesSecondaryFilters(t))) {
-      agencyFilter = '';
-    }
+    setGateway(id);
     refreshFilters();
   });
+}
+
+/**
+ * One gateway for the whole submission. The query filter and the URA check's
+ * own gateway selector always agree, whichever of them was touched.
+ */
+function setGateway(gateway) {
+  gatewayFilter = gateway;
+  checkInputs.set('ura.gateway', gateway);
+  // A drill-down: if the authority chosen below no longer has anything under
+  // this gateway, drop back to "all authorities" rather than showing nothing.
+  if (agencyFilter && ruleset && !ruleset.targets.some((t) =>
+    t.agency === agencyFilter && (!gatewayFilter || t.gateway === gatewayFilter) && matchesSecondaryFilters(t))) {
+    agencyFilter = '';
+  }
+  renderCheckMenu();
 }
 
 /** Authority is the second tier: scoped by whichever gateway is currently selected. */
 function renderAgencyBubbles() {
   if (!el.agencyBubbles) return;
   const base = ruleset.targets.filter((t) =>
-    (!gatewayFilter || t.gateway === gatewayFilter) && matchesSecondaryFilters(t));
+    (!gatewayFilter || t.gateway === gatewayFilter) && matchesSecondaryFilters(t) &&
+    (!projectAuthorities || t.agency === AGENCY_ALL || projectAuthorities.has(t.agency)));
   // "ALL" is not an authority but a component every authority queries, so it
-  // gets no bubble of its own and is counted under each of the others.
-  const agencies = ruleset.agencies.filter((a) => a !== AGENCY_ALL);
+  // gets no bubble of its own and is counted under each of the others. An
+  // authority the project scopes out gets no bubble either.
+  const agencies = ruleset.agencies.filter((a) =>
+    a !== AGENCY_ALL && (!projectAuthorities || projectAuthorities.has(a)));
   const items = [
     { id: '', label: 'All', n: base.length },
     ...agencies.map((a) => ({ id: a, label: a, n: base.filter((t) => appliesToAgency(t, a)).length })),
@@ -1146,6 +1231,9 @@ function selectProperty(group, req) {
   }));
   el.legendTitle.innerHTML =
     `${esc(req.prop)}<small>${esc(group.component)} · ${esc(req.pset)} · ${elements.length} elements</small>`;
+  // A property query can be fixed in bulk from the legend.
+  el.btnSetValue.hidden = !elements.some(canEdit);
+  el.legendEdit.classList.remove('visible');
 
   renderTree();
   renderLegend();
@@ -1162,6 +1250,11 @@ function clearQuery() {
 }
 
 function renderLegend() {
+  // Bulk edit only makes sense for a property query.
+  if (!selection || !selection.req) {
+    el.btnSetValue.hidden = true;
+    el.legendEdit.classList.remove('visible');
+  }
   if (!legend.length) {
     el.legend.classList.remove('visible');
     return;
@@ -1344,6 +1437,7 @@ function renderCheckMenu() {
 
   wireCheckInputs();
   updateRunButton();
+  renderProjectChip();
 }
 
 /** The extra inputs a check declares, shown only while that check is selected. */
@@ -1435,6 +1529,7 @@ function wireCheckInputs() {
       const v = box.value.trim();
       if (v) checkInputs.set(box.dataset.text, v);
       else checkInputs.delete(box.dataset.text);
+      renderProjectChip();
     });
   });
 
@@ -1442,7 +1537,13 @@ function wireCheckInputs() {
     box.addEventListener('click', (e) => e.stopPropagation());
     box.addEventListener('change', (e) => {
       e.stopPropagation();
+      if (box.dataset.select === 'ura.gateway') {
+        setGateway(box.value);
+        refreshFilters();
+        return;
+      }
       checkInputs.set(box.dataset.select, box.value);
+      renderProjectChip();
     });
   });
 }
@@ -1492,8 +1593,7 @@ async function doRunCheck() {
     ruleset,
     modelNames: new Map(viewer.entries.map((e) => [e.modelID, e.name])),
     filter: (t) =>
-      (!gatewayFilter || t.gateway === gatewayFilter) &&
-      appliesToAgency(t, agencyFilter),
+      (!gatewayFilter || t.gateway === gatewayFilter) && inScope(t),
     signal: checkAbort.signal,
     progress: () => {},
     inputsFor,
@@ -1521,6 +1621,17 @@ async function doRunCheck() {
     renderCheckResults();
     renderCheckMenu();
     el.btnColourStatus.disabled = !checkOutcomes.some((o) => o.result);
+    el.btnToBcf.disabled = !checkOutcomes.some((o) => o.result && o.result.findings &&
+      o.result.findings.some((f) => f.severity === SEVERITY.FAIL || f.severity === SEVERITY.WARN));
+    el.btnReport.disabled = !checkOutcomes.length;
+    // The run is the moment a model's results are known: record them, so a
+    // submission checked one file at a time still adds up in the project file.
+    // Recording is a convenience; a failure here must not lose the results.
+    try {
+      captureModelRecords();
+    } catch (err) {
+      console.error('The models could not be recorded in the project:', err);
+    }
 
     const broken = checkOutcomes.filter((o) => o.error);
     if (broken.length) {
@@ -1879,7 +1990,11 @@ function showElement(item) {
     ['GlobalId', item.globalId],
   ].filter(([, v]) => v !== null && v !== undefined && v !== '');
 
-  let html = `<div class="prop-type">${esc(item.name || item.entity)}</div>
+  lastPicked = item;
+  const editable = canEdit(item);
+  const fixable = []; // requirements behind the "Fix" buttons, by index
+  let html = `<div class="prop-type">${esc(item.name || item.entity)}${editable
+    ? ' <button class="btn xs" data-rename title="Rename this element in the IFC">Rename</button>' : ''}</div>
               <div class="prop-id">Express ID ${item.expressID}</div>`;
   html += rows.map(([k, v]) =>
     `<div class="prop-row"><span class="k">${esc(k)}</span><span class="v">${esc(v)}</span></div>`).join('');
@@ -1930,11 +2045,18 @@ function showElement(item) {
         }
         const colour = hex(f.colour !== undefined ? f.colour : SEVERITY_COLOUR[f.severity]);
         const detail = f.severity === SEVERITY.PASS ? '' : ' — ' + esc(f.label);
+        // A failing IFC-SG requirement can be fixed in place: the finding
+        // carries the requirement, so the editor knows the pset, property and type.
+        let fix = '';
+        if (editable && f.req && f.severity !== SEVERITY.PASS) {
+          fixable.push(f.req);
+          fix = `<button class="btn xs" data-fix="${fixable.length - 1}">Fix</button>`;
+        }
         html += `
           <div class="chk-row">
             <span class="status-dot" style="background:${colour}" title="${esc(f.label)}"></span>
             <span class="ck">${esc(f.message || f.label)}<small>${detail}</small></span>
-            <span class="cv">${esc(f.value === undefined ? '' : f.value)}</span>
+            <span class="cv">${esc(f.value === undefined ? '' : f.value)}</span>${fix}
           </div>`;
       }
     }
@@ -1947,8 +2069,10 @@ function showElement(item) {
     for (const pn of psetNames) {
       html += `<div class="pset-name">${esc(pn)}</div>`;
       for (const [k, v] of Object.entries(item.psets[pn])) {
+        const pencil = editable
+          ? `<button class="btn xs" data-edit data-pset="${esc(pn)}" data-prop="${esc(k)}" title="Change this value in the IFC">Edit</button>` : '';
         html += `<div class="prop-row"><span class="k">${esc(k)}</span>
-                 <span class="v">${esc(isEmptyValue(v) ? '—' : formatValue(v))}</span></div>`;
+                 <span class="v">${esc(isEmptyValue(v) ? '—' : formatValue(v))}${pencil}</span></div>`;
       }
     }
   }
@@ -1963,6 +2087,1377 @@ function showElement(item) {
       const target = index && index.byId.get(hostLink.dataset.host);
       if (target) showElement(target);
     });
+  }
+
+  // Editing affordances: each opens an inline row under the thing it edits.
+  el.panelBody.querySelectorAll('[data-fix]').forEach((b) => {
+    b.addEventListener('click', () => {
+      const req = fixable[+b.dataset.fix];
+      const current = getValue(item, req.pset, req.prop);
+      openInlineEdit(b.closest('.chk-row'), {
+        label: `${req.pset}.${req.prop}`,
+        value: isEmptyValue(current) ? '' : formatValue(current),
+        options: acceptedOptions(req),
+        hint: req.dataType ? `Type: ${req.dataType}` : '',
+        onSave: (v) => editProperty(item, req.pset, req.prop, v, { dataType: req.dataType }).then(() => showElement(item)),
+      });
+    });
+  });
+  el.panelBody.querySelectorAll('[data-edit]').forEach((b) => {
+    b.addEventListener('click', () => {
+      const { pset, prop } = b.dataset;
+      const current = item.psets[pset] ? item.psets[pset][prop] : undefined;
+      openInlineEdit(b.closest('.prop-row'), {
+        label: `${pset}.${prop}`,
+        value: isEmptyValue(current) ? '' : formatValue(current),
+        options: typeof current === 'boolean' ? ['TRUE', 'FALSE'] : null,
+        onSave: (v) => editProperty(item, pset, prop, v).then(() => showElement(item)),
+      });
+    });
+  });
+  const renameBtn = el.panelBody.querySelector('[data-rename]');
+  if (renameBtn) {
+    renameBtn.addEventListener('click', () => {
+      openInlineEdit(renameBtn.closest('.prop-type'), {
+        label: 'Name',
+        value: item.name || '',
+        onSave: (v) => renameElement(item, v).then(() => showElement(item)),
+      });
+    });
+  }
+}
+
+// ----------------------------------------------------------------- project file
+
+/**
+ * The active project (see project.js for the format). It is where the
+ * submission context, the check selection and every check input are kept
+ * between sessions. `projectHandle` is the file on disk when the browser can
+ * write back to it; `projectSavedFp` is the state as last saved or opened, so
+ * the chip can show unsaved changes.
+ */
+let project = null;
+let projectHandle = null;
+let projectSavedFp = null;
+/** Authorities the project puts in scope, or null for every authority. */
+let projectAuthorities = null;
+
+/** Is a check's authority inside the project scope? IFC-SG checks always are. */
+function checkInScope(check) {
+  const a = String(check.authority || '').toUpperCase();
+  return a === 'IFC-SG' || !projectAuthorities || projectAuthorities.has(a);
+}
+
+/** The current state as a project document, ready to save. */
+function collectProject() {
+  const base = project || emptyProject();
+  // The submission's file list: the recorded models once there are any, since
+  // those name every file checked so far rather than only the ones open now.
+  const files = base.models && base.models.length
+    ? base.models.map((m) => m.name)
+    : (viewer && viewer.hasModels ? viewer.entries.map((e) => e.name) : base.project.files);
+  const inputs = {};
+  // The submission gateway carries the URA selector, so it is not repeated here.
+  for (const [key, value] of checkInputs) if (key !== 'ura.gateway') inputs[key] = value;
+  return {
+    format: PROJECT_FORMAT,
+    version: PROJECT_VERSION,
+    project: { ...base.project, files },
+    submission: {
+      gateway: gatewayFilter || GATEWAY.CONSTRUCTION,
+      authorities: projectAuthorities ? [...projectAuthorities] : [],
+    },
+    checks: {
+      selected: registry.all().map((c) => c.id).filter((id) => selectedChecks.has(id)),
+      inputs,
+      presets: enabledPresets().map((p) => p.id),
+    },
+    // What each model is, what it measured and how it checked. Written by
+    // captureModelRecords after every run; carried through untouched here.
+    models: base.models || [],
+    ruleset: { generated: ruleset ? ruleset.meta.generated : base.ruleset.generated },
+    // Hand edits made in the viewer, by file, so the team can see what changed
+    // outside Revit. Informational: they are not re-applied on load.
+    edits: editLogsByFile(base.edits || {}),
+    saved: base.saved,
+  };
+}
+
+/**
+ * Makes a project the app's state: gateway, authority scope, check selection,
+ * check inputs and preset ticks. Anything the file does not say keeps its
+ * default rather than the previous project's value.
+ */
+async function applyProject(p, { handle = null, quiet = false } = {}) {
+  project = p;
+  projectHandle = handle;
+  projectAuthorities = p.submission.authorities.length ? new Set(p.submission.authorities) : null;
+  if (agencyFilter && projectAuthorities && !projectAuthorities.has(agencyFilter)) agencyFilter = '';
+
+  const unknown = [];
+  if (p.checks.selected) {
+    selectedChecks = new Set();
+    for (const id of p.checks.selected) {
+      if (registry.byId(id)) selectedChecks.add(id);
+      else unknown.push(id);
+    }
+  } else {
+    // A file that never recorded a selection: every check its authorities ask for.
+    selectedChecks = new Set(registry.all()
+      .filter((c) => !c.experimental && checkInScope(c)).map((c) => c.id));
+  }
+  saveSelection();
+
+  checkInputs.clear();
+  for (const [key, value] of Object.entries(p.checks.inputs)) checkInputs.set(key, value);
+  setGateway(p.submission.gateway);
+
+  await applyPresetTicks(p.checks.presets);
+
+  const now = collectProject();
+  projectSavedFp = fingerprint(now);
+  rememberProject(now);
+  refreshFilters();
+  renderCheckMenu();
+  renderStartProjects();
+
+  if (!quiet) toast(`Project ${labelOf(p)} loaded.`);
+  if (unknown.length) toast(`Checks the project names but this viewer lacks were ignored: ${unknown.join(', ')}.`);
+  if (ruleset && p.ruleset.generated && p.ruleset.generated !== ruleset.meta.generated) {
+    toast('This project was saved against a different IFC-SG workbook. Requirements may have changed since.');
+  }
+}
+
+/**
+ * Ticks exactly the presets the project names. Ticks live in the shared
+ * presets file, so this writes through the same store the editor uses; on a
+ * host where that file is read-only the ticks are left as they are.
+ */
+async function applyPresetTicks(ids) {
+  if (!ids) return;
+  await loadPresets();
+  const want = new Set(ids);
+  const list = currentPresets();
+  const next = list.map((p) => ({ ...p, enabled: want.has(p.id) }));
+  if (next.every((p, i) => p.enabled === list[i].enabled)) return;
+  if (!canSave()) {
+    toast('The project\'s preset ticks could not be applied: presets are read-only on this host.');
+    return;
+  }
+  try {
+    await savePresets(next);
+  } catch (err) {
+    console.error(err);
+    toast('The project\'s preset ticks could not be applied: ' + err.message);
+  }
+}
+
+async function restoreLastProject() {
+  renderStartProjects();
+  const p = lastProject();
+  if (!p) return;
+  try {
+    await applyProject(p, { quiet: true });
+    toast(`Project ${labelOf(p)} restored from last time.`);
+  } catch (err) {
+    console.error(err);
+    clearLastProject();
+  }
+}
+
+/** Reads a dropped or chosen file and applies it. */
+async function openProjectFile(file, handle = null) {
+  try {
+    const p = parseProject(await file.text());
+    await applyProject(p, { handle });
+  } catch (err) {
+    console.error(err);
+    toast(`${file.name}: ${err.message}`);
+  }
+}
+
+async function openProjectPicker() {
+  try {
+    const opened = await openFromDisk();
+    if (opened) await applyProject(opened.project, { handle: opened.handle });
+  } catch (err) {
+    console.error(err);
+    toast('The project could not be opened: ' + err.message);
+  }
+}
+
+function newProject() {
+  project = emptyProject();
+  projectHandle = null;
+  projectSavedFp = null;
+  clearLastProject();
+  renderProjectChip();
+  openProjectPanel(true);
+}
+
+async function saveProject(forcePicker = false) {
+  const p = collectProject();
+  p.saved = new Date().toISOString();
+  try {
+    // The picker must be opened inside the click that asked for it, so
+    // nothing awaits before saveToDisk.
+    const { handle, name } = await saveToDisk(p, projectHandle, forcePicker);
+    project = p;
+    projectHandle = handle;
+    projectSavedFp = fingerprint(p);
+    rememberProject(p);
+    renderProjectChip();
+    renderProjectPanel();
+    renderStartProjects();
+    toast(`Project saved as ${name}.`);
+  } catch (err) {
+    if (err && err.name === 'AbortError') return;
+    console.error(err);
+    toast('The project could not be saved: ' + err.message);
+  }
+}
+
+/** True while the state differs from what the project file holds. */
+function projectDirty() {
+  if (!project) return false;
+  if (projectSavedFp === null) return true;
+  return fingerprint(collectProject()) !== projectSavedFp;
+}
+
+function renderProjectChip() {
+  if (!el.projectChip) return;
+  const name = el.projectChip.querySelector('.pc-name');
+  const dot = el.projectChip.querySelector('.pc-dot');
+  if (!project) {
+    name.textContent = 'No project';
+    el.projectChip.classList.remove('has-project');
+    el.projectChip.title = 'Project settings: save the submission context and check setup to a file';
+    dot.hidden = true;
+  } else {
+    const dirty = projectDirty();
+    name.textContent = `${labelOf(project)} · ${GATEWAY_LABEL[gatewayFilter] || gatewayFilter}`;
+    el.projectChip.classList.add('has-project');
+    el.projectChip.title = dirty ? 'Project has unsaved changes' : 'Project settings';
+    dot.hidden = !dirty;
+  }
+  if (el.projectPicker.classList.contains('open')) renderProjectPanel();
+}
+
+function openProjectPanel(focusCode = false) {
+  el.projectPicker.classList.add('open');
+  el.modelPicker.classList.remove('open');
+  renderProjectPanel();
+  if (focusCode) {
+    const box = el.projectPanel.querySelector('[data-f="code"]');
+    if (box) box.focus();
+  }
+}
+
+function renderProjectPanel() {
+  if (!el.projectPicker.classList.contains('open')) return;
+  const p = project || emptyProject();
+  const dirty = projectDirty();
+  const agencies = ruleset ? ruleset.agencies.filter((a) => a !== AGENCY_ALL) : [];
+  const rows = reconcileModels();
+  const totals = submissionTotals();
+  const nChecks = selectedChecks.size;
+  const inputCount = [...checkInputs.keys()].filter((k) => k !== 'ura.gateway').length;
+
+  el.projectPanel.innerHTML = `
+    <div class="pp-head">
+      <span>PROJECT</span>
+      <span class="pp-state">${!project ? 'none open'
+        : dirty ? (projectSavedFp === null ? 'not saved yet' : 'unsaved changes')
+          : (p.saved ? 'saved ' + new Date(p.saved).toLocaleString() : 'saved')}</span>
+    </div>
+    <div class="pp-body">
+      <label class="pp-field"><span>Project code</span>
+        <input data-f="code" value="${esc(p.project.code)}" placeholder="e.g. 250008" /></label>
+      <label class="pp-field"><span>Name</span>
+        <input data-f="name" value="${esc(p.project.name)}" placeholder="Development name" /></label>
+      <label class="pp-field"><span>Developer / client</span>
+        <input data-f="developer" value="${esc(p.project.developer)}" /></label>
+      <label class="pp-field"><span>Cadastral lots</span>
+        <input data-f="lots" value="${esc(p.project.lots.join(', '))}" placeholder="MK18-01234A, MK18-01235K" /></label>
+
+      <div class="pp-field"><span>Submission gateway</span>
+        <select data-f="gateway">${GATEWAY_ORDER.map((g) =>
+          `<option value="${g}"${g === gatewayFilter ? ' selected' : ''}>${esc(GATEWAY_LABEL[g])}</option>`).join('')}
+        </select></div>
+
+      <div class="pp-field"><span>Authorities in scope <small>none ticked = all</small></span>
+        <div class="bubble-row plain">${agencies.map((a) =>
+          `<button class="bubble${projectAuthorities && projectAuthorities.has(a) ? ' active' : ''}" data-auth="${esc(a)}">${esc(a)}</button>`).join('')}
+        </div></div>
+
+      <div class="pp-field"><span>Checks</span>
+        <div class="pp-note">${nChecks} selected · ${inputCount} input${inputCount === 1 ? '' : 's'} supplied · ${enabledPresets().length} preset${enabledPresets().length === 1 ? '' : 's'} ticked
+          <small>Set these on the Compliance tab. They are saved with the project.</small></div></div>
+
+      <div class="pp-field"><span>Models <small>matched by content, not by file name</small></span>
+        ${rows.length ? `<ul class="pp-models">${rows.map((r, i) => `
+          <li class="st-${r.state}" data-row="${i}" title="${esc(r.record && r.record.identity ? describeIdentity(r.record.identity) : (r.identity ? describeIdentity(r.identity) : ''))}">
+            <div class="pm-top">
+              <span class="pm-name">${esc(r.name)}</span>
+              <span class="chip ${r.state === RECORD_STATE.MATCH ? 'done' : r.state === RECORD_STATE.NEW || r.state === RECORD_STATE.MISSING || r.state === RECORD_STATE.LEGACY ? '' : 'alert'}">${esc(STATE_LABEL[r.state])}</span>
+            </div>
+            <div class="pm-sub">${esc(modelSubtitle(r))}</div>
+            ${r.reasons.length ? `<div class="pm-why">${esc(r.reasons.join('; '))}</div>` : ''}
+            ${r.state === RECORD_STATE.RENAMED
+              ? `<div class="pm-act"><button class="btn xs" data-rename-record="${i}">Use the new name</button></div>` : ''}
+            ${r.state === RECORD_STATE.UPDATED
+              ? `<div class="pm-act"><button class="btn xs" data-recheck="${i}">Re-check to refresh</button></div>` : ''}
+            ${r.record ? `<div class="pm-act"><button class="btn xs" data-forget-record="${i}">Forget</button></div>` : ''}
+          </li>`).join('')}</ul>`
+          : '<div class="pp-note">No models recorded yet. Load a model and run the checks; its results are recorded here.</div>'}
+        <div class="pp-note" style="margin-top:6px">
+          ${totals.checked
+            ? `${totals.checked} of ${totals.models} recorded model${totals.models === 1 ? '' : 's'} checked · ${totals.elements} elements · ${totals.fail} failure${totals.fail === 1 ? '' : 's'}, ${totals.warn} warning${totals.warn === 1 ? '' : 's'} across the submission`
+            : 'Run the checks to record a model.'}
+          ${viewer.hasModels ? '<button class="btn xs" data-record style="margin-left:6px">Record loaded models</button>' : ''}
+        </div>
+      </div>
+    </div>
+    <div class="pp-actions">
+      <button class="btn sm" data-act="new">New</button>
+      <button class="btn sm" data-act="open">Open…</button>
+      <span class="spacer"></span>
+      <button class="btn sm" data-act="save-as">Save as…</button>
+      <button class="btn sm primary" data-act="save"${project ? '' : ' disabled'}>Save</button>
+    </div>`;
+
+  const ensureProject = () => { if (!project) { project = emptyProject(); projectSavedFp = null; } };
+
+  el.projectPanel.querySelectorAll('input[data-f]').forEach((box) => {
+    box.addEventListener('input', () => {
+      ensureProject();
+      const f = box.dataset.f;
+      project.project[f] = f === 'lots'
+        ? box.value.split(/[,;\n]/).map((s) => s.trim()).filter(Boolean)
+        : box.value.trim();
+      // Only the chip: redrawing the panel mid-keystroke would lose the caret.
+      const dot = el.projectChip.querySelector('.pc-dot');
+      dot.hidden = !projectDirty();
+      el.projectChip.querySelector('.pc-name').textContent =
+        `${labelOf(project)} · ${GATEWAY_LABEL[gatewayFilter] || gatewayFilter}`;
+      el.projectChip.classList.add('has-project');
+      el.projectPanel.querySelector('[data-act="save"]').disabled = false;
+    });
+  });
+
+  el.projectPanel.querySelector('[data-f="gateway"]').addEventListener('change', (e) => {
+    ensureProject();
+    setGateway(e.target.value);
+    refreshFilters();
+  });
+
+  el.projectPanel.querySelectorAll('[data-auth]').forEach((b) => {
+    b.addEventListener('click', () => {
+      ensureProject();
+      const a = b.dataset.auth;
+      const set = new Set(projectAuthorities || []);
+      const adding = !set.has(a);
+      if (adding) set.add(a); else set.delete(a);
+      projectAuthorities = set.size ? set : null;
+      // The authority's checks follow it in and out of scope; other checks are left alone.
+      for (const c of registry.all()) {
+        if (String(c.authority).toUpperCase() !== a) continue;
+        if (adding && !c.experimental) selectedChecks.add(c.id);
+        if (!adding) selectedChecks.delete(c.id);
+      }
+      saveSelection();
+      refreshFilters();
+      renderCheckMenu();
+    });
+  });
+
+  const recordBtn = el.projectPanel.querySelector('[data-record]');
+  if (recordBtn) {
+    recordBtn.addEventListener('click', () => {
+      const n = captureModelRecords();
+      toast(`${n} model${n === 1 ? '' : 's'} recorded in the project.`);
+    });
+  }
+  el.projectPanel.querySelectorAll('[data-rename-record]').forEach((b) => {
+    b.addEventListener('click', () => {
+      const row = rows[+b.dataset.renameRecord];
+      const was = row.record.name;
+      row.record.name = row.name;
+      renderProjectPanel();
+      renderProjectChip();
+      toast(`Recorded as "${row.name}" — it was "${was}".`);
+    });
+  });
+  el.projectPanel.querySelectorAll('[data-recheck]').forEach((b) => {
+    b.addEventListener('click', () => {
+      el.projectPicker.classList.remove('open');
+      showTab('check');
+      toast('This file has been re-issued since it was recorded. Run the checks to refresh its record.');
+    });
+  });
+  el.projectPanel.querySelectorAll('[data-forget-record]').forEach((b) => {
+    b.addEventListener('click', () => {
+      const row = rows[+b.dataset.forgetRecord];
+      if (!window.confirm(`Forget the record for "${row.record.name}"? Its results leave the project file.`)) return;
+      project.models = project.models.filter((m) => m !== row.record);
+      renderProjectPanel();
+      renderProjectChip();
+    });
+  });
+
+  el.projectPanel.querySelector('[data-act="new"]').addEventListener('click', newProject);
+  el.projectPanel.querySelector('[data-act="open"]').addEventListener('click', openProjectPicker);
+  el.projectPanel.querySelector('[data-act="save"]').addEventListener('click', () => saveProject(false));
+  el.projectPanel.querySelector('[data-act="save-as"]').addEventListener('click', () => {
+    ensureProject();
+    saveProject(true);
+  });
+}
+
+/** The start card's project row: open a file, start fresh, or pick a recent one. */
+function renderStartProjects() {
+  if (!el.startProjects) return;
+  const recent = recentProjects();
+  el.startProjects.innerHTML = `
+    <div class="sp-row">
+      <button class="btn" data-act="open">Open project file…</button>
+      <button class="btn" data-act="new">New project</button>
+    </div>
+    ${recent.length ? `<div class="sp-recent"><span>Recent</span>${recent.map((r) => `
+      <button class="sp-item" data-key="${esc(r.key)}" title="${esc(r.saved ? 'Saved ' + new Date(r.saved).toLocaleString() : 'Not saved to disk')}">
+        ${esc(r.label)}<small>${esc(r.project.submission.gateway === 'design' ? 'Design Gateway' : 'Construction Gateway')}</small>
+      </button>
+      <button class="sp-forget" data-forget="${esc(r.key)}" title="Remove from this list">&times;</button>`).join('')}</div>` : ''}`;
+
+  // These open the project panel; the same click must not reach the document
+  // listener that closes it.
+  el.startProjects.querySelector('[data-act="open"]').addEventListener('click', (e) => {
+    e.stopPropagation();
+    openProjectPicker();
+  });
+  el.startProjects.querySelector('[data-act="new"]').addEventListener('click', (e) => {
+    e.stopPropagation();
+    newProject();
+  });
+  el.startProjects.querySelectorAll('.sp-item').forEach((b) => {
+    b.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const hit = recentProjects().find((r) => r.key === b.dataset.key);
+      if (!hit) return;
+      try {
+        await applyProject(parseProject(JSON.stringify(hit.project)));
+      } catch (err) {
+        console.error(err);
+        toast('That project could not be restored: ' + err.message);
+      }
+    });
+  });
+  el.startProjects.querySelectorAll('[data-forget]').forEach((b) => {
+    b.addEventListener('click', () => {
+      forgetRecent(b.dataset.forget);
+      renderStartProjects();
+    });
+  });
+}
+
+function wireProjectUI() {
+  el.projectChip.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (el.projectPicker.classList.contains('open')) el.projectPicker.classList.remove('open');
+    else openProjectPanel();
+  });
+  el.projectPanel.addEventListener('click', (e) => e.stopPropagation());
+  document.addEventListener('click', () => el.projectPicker.classList.remove('open'));
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') el.projectPicker.classList.remove('open');
+  });
+  window.addEventListener('beforeunload', (e) => {
+    if (!projectDirty()) return;
+    e.preventDefault();
+    e.returnValue = '';
+  });
+}
+
+// ------------------------------------------------------------------------- tabs
+
+function showTab(tab) {
+  for (const id of ['query', 'check', 'issues']) {
+    $('tab-' + id).style.display = id === tab ? 'flex' : 'none';
+  }
+  document.querySelectorAll('.tabs button').forEach((x) => x.classList.toggle('active', x.dataset.tab === tab));
+}
+
+// -------------------------------------------------------------------- IFC editing
+
+/** modelID -> IfcEditor, created the first time that model is edited. */
+const editors = new Map();
+/** modelID -> text scan, shared by GUID lookup and the editor. */
+const textScans = new Map();
+/** The element the inspector last showed; new BCF topics attach to it. */
+let lastPicked = null;
+
+/** Can this element be edited? Only while its source file is still to hand. */
+function canEdit(item) {
+  const entry = item && viewer && viewer.models.get(item.modelID);
+  return !!(entry && entry.file);
+}
+
+/** The text scan for a model, made once and reused by editing and BCF. */
+async function textScanFor(modelID) {
+  let scan = textScans.get(modelID);
+  if (scan) return scan;
+  const entry = viewer.models.get(modelID);
+  if (!entry || !entry.file) throw new Error('The source file for this model is no longer available.');
+  el.loading.classList.add('visible');
+  try {
+    scan = await scanFile(entry.file, (pct) => setProgress(pct, `Reading ${entry.name}…`));
+  } finally {
+    el.loading.classList.remove('visible');
+  }
+  textScans.set(modelID, scan);
+  return scan;
+}
+
+async function editorFor(modelID) {
+  let ed = editors.get(modelID);
+  if (ed) return ed;
+  const entry = viewer.models.get(modelID);
+  if (!entry || !entry.file) throw new Error('The source file for this model is no longer available.');
+  ed = new IfcEditor(entry.file, { name: entry.name, scan: textScans.get(modelID) || null });
+  el.loading.classList.add('visible');
+  try {
+    await ed.prepare((msg, pct) => setProgress(pct, `${msg} (${entry.name})`));
+  } finally {
+    el.loading.classList.remove('visible');
+  }
+  if (ed.scan) textScans.set(modelID, ed.scan);
+  editors.set(modelID, ed);
+  return ed;
+}
+
+/** Sets a property in the file and mirrors it into the index straight away. */
+async function editProperty(element, pset, prop, value, { dataType = null } = {}) {
+  try {
+    const ed = await editorFor(element.modelID);
+    const stored = await ed.setProperty(element, pset, prop, value, { dataType });
+    const psetKey = Object.keys(element.psets).find((k) => k.toUpperCase() === pset.toUpperCase()) || pset;
+    if (!element.psets[psetKey]) element.psets[psetKey] = {};
+    const propKey = Object.keys(element.psets[psetKey]).find((k) => k.toUpperCase() === prop.toUpperCase()) || prop;
+    element.psets[psetKey][propKey] = stored;
+    afterEdit();
+    return stored;
+  } catch (err) {
+    console.error(err);
+    toast('The edit could not be made: ' + err.message);
+    throw err;
+  }
+}
+
+async function renameElement(element, name) {
+  try {
+    const ed = await editorFor(element.modelID);
+    await ed.setName(element, name);
+    element.name = name;
+    for (const s of (index && index.storeys) || []) {
+      if (s.modelID === element.modelID && s.expressID === element.expressID) s.name = name;
+    }
+    afterEdit();
+    return name;
+  } catch (err) {
+    console.error(err);
+    toast('The rename could not be made: ' + err.message);
+    throw err;
+  }
+}
+
+/** Refreshes everything that shows values after an edit landed. */
+function afterEdit() {
+  renderEditsBar();
+  renderProjectChip();
+  // A property query's legend is a picture of the values, so redraw it.
+  if (selection && selection.req) selectProperty(selection.group, selection.req);
+}
+
+function renderEditsBar() {
+  const list = [...editors.values()].filter((ed) => ed.hasEdits);
+  const n = list.reduce((s, ed) => s + ed.editCount, 0);
+  el.editsBar.classList.toggle('visible', n > 0);
+  if (!n) return;
+  el.editsText.innerHTML = `${n} edit${n === 1 ? '' : 's'} in ${list.length} file${list.length === 1 ? '' : 's'}` +
+    `<small>Export writes the changed lines into a copy of each file. The Revit model is unchanged.</small>`;
+}
+
+/** Log per file for the project record, this session's edits over the saved ones. */
+function editLogsByFile(saved) {
+  const out = { ...saved };
+  for (const ed of editors.values()) {
+    if (ed.log.length) out[ed.name] = ed.log;
+  }
+  return out;
+}
+
+/** The values a requirement accepts, as options for the inline editor. */
+function acceptedOptions(req) {
+  const acc = req.accepted || {};
+  if (acc.kind === 'boolean' || req.dataType === 'Boolean') return ['TRUE', 'FALSE'];
+  if (acc.kind === 'enum' && acc.values && acc.values.length) return acc.values;
+  if (acc.kind === 'spaceValues' && ruleset && ruleset.spaceValues[req.prop]) {
+    return ruleset.spaceValues[req.prop].map((v) => v.value);
+  }
+  return null;
+}
+
+/**
+ * An inline editor under a row: a select when the values are enumerated, a
+ * text box otherwise. Enter saves, Escape cancels, and the row is the only
+ * one open at a time.
+ */
+function openInlineEdit(anchor, { label, value, options = null, hint = '', onSave }) {
+  el.panelBody.querySelectorAll('.edit-row').forEach((r) => r.remove());
+  const row = document.createElement('div');
+  row.className = 'edit-row';
+  const control = options
+    ? `<select>${options.map((o) => `<option value="${esc(o)}"${String(o).toUpperCase() === String(value).toUpperCase() ? ' selected' : ''}>${esc(o)}</option>`).join('')}</select>`
+    : `<input type="text" value="${esc(value)}" placeholder="${esc(label)}" />`;
+  row.innerHTML = `${control}<button class="btn xs primary" data-save>Save</button><button class="btn xs" data-cancel>Cancel</button>` +
+    (hint ? `<span class="hint">${esc(hint)}</span>` : '');
+  anchor.insertAdjacentElement('afterend', row);
+  const box = row.querySelector('input, select');
+  box.focus();
+  if (box.select) box.select();
+
+  const save = async () => {
+    const v = box.value.trim();
+    if (!v && !options) { toast('Enter a value, or cancel.'); return; }
+    row.querySelector('[data-save]').disabled = true;
+    try {
+      await onSave(v);
+    } catch {
+      row.querySelector('[data-save]').disabled = false;
+    }
+  };
+  row.querySelector('[data-save]').addEventListener('click', save);
+  row.querySelector('[data-cancel]').addEventListener('click', () => row.remove());
+  box.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); save(); }
+    if (e.key === 'Escape') row.remove();
+  });
+}
+
+/** Writes every edited file, each validated first. */
+async function exportEdits() {
+  const list = [...editors.values()].filter((ed) => ed.hasEdits);
+  if (!list.length) return;
+  el.btnExportIfc.disabled = true;
+  try {
+    for (const ed of list) {
+      el.loading.classList.add('visible');
+      setProgress(30, `Validating ${ed.exportName}…`);
+      let check;
+      try {
+        check = await ed.validate(WebIFC, WASM_PATH);
+      } finally {
+        el.loading.classList.remove('visible');
+      }
+      if (!check.ok) {
+        console.error(check.problems);
+        toast(`${ed.name}: the edited lines did not validate — ${check.problems[0]}`);
+        continue;
+      }
+      const blob = ed.export();
+      await saveBlob(blob, ed.exportName, [{ description: 'IFC', accept: { 'application/octet-stream': ['.ifc'] } }]);
+      toast(`${ed.exportName} written (${ed.editCount} edit${ed.editCount === 1 ? '' : 's'}).`);
+    }
+  } catch (err) {
+    if (!(err && err.name === 'AbortError')) {
+      console.error(err);
+      toast('The export failed: ' + err.message);
+    }
+  } finally {
+    el.btnExportIfc.disabled = false;
+  }
+}
+
+/** Saves a blob through the native picker where it exists, else as a download. */
+async function saveBlob(blob, name, types) {
+  if (typeof window.showSaveFilePicker === 'function') {
+    const handle = await window.showSaveFilePicker({ suggestedName: name, types });
+    const w = await handle.createWritable();
+    await w.write(blob);
+    await w.close();
+    return;
+  }
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
+function discardEdits() {
+  const n = [...editors.values()].reduce((s, ed) => s + ed.editCount, 0);
+  if (!n) return;
+  if (!window.confirm(`Forget all ${n} edit${n === 1 ? '' : 's'}? The values shown will no longer match the file.`)) return;
+  for (const ed of editors.values()) ed.discard();
+  renderEditsBar();
+  renderProjectChip();
+  toast('Edits discarded. Reload the model to see the original values again.');
+}
+
+/** The legend's bulk edit: one value onto every element the legend shows. */
+function openLegendEdit() {
+  if (!selection || !selection.req) return;
+  const req = selection.req;
+  const targets = legend
+    .filter((g, i) => soloIndex < 0 || soloIndex === i)
+    .flatMap((g) => g.elements).filter(canEdit);
+  const options = acceptedOptions(req);
+  el.legendEdit.innerHTML = (options
+    ? `<select>${options.map((o) => `<option value="${esc(o)}">${esc(o)}</option>`).join('')}</select>`
+    : `<input type="text" placeholder="${esc(req.prop)} value" />`) +
+    `<button class="btn xs primary" data-apply>Set on ${targets.length}</button><button class="btn xs" data-cancel>Cancel</button>`;
+  el.legendEdit.classList.add('visible');
+  const box = el.legendEdit.querySelector('input, select');
+  box.focus();
+  el.legendEdit.querySelector('[data-cancel]').addEventListener('click', () => el.legendEdit.classList.remove('visible'));
+  el.legendEdit.querySelector('[data-apply]').addEventListener('click', async () => {
+    const v = box.value.trim();
+    if (!v) return;
+    el.legendEdit.querySelector('[data-apply]').disabled = true;
+    let done = 0;
+    for (const element of targets) {
+      try {
+        const ed = await editorFor(element.modelID);
+        const stored = await ed.setProperty(element, req.pset, req.prop, v, { dataType: req.dataType });
+        const psetKey = Object.keys(element.psets).find((k) => k.toUpperCase() === req.pset.toUpperCase()) || req.pset;
+        if (!element.psets[psetKey]) element.psets[psetKey] = {};
+        const propKey = Object.keys(element.psets[psetKey]).find((k) => k.toUpperCase() === req.prop.toUpperCase()) || req.prop;
+        element.psets[psetKey][propKey] = stored;
+        done++;
+      } catch (err) {
+        console.error(err);
+        toast(`Stopped after ${done} elements: ${err.message}`);
+        break;
+      }
+    }
+    el.legendEdit.classList.remove('visible');
+    toast(`${req.pset}.${req.prop} set on ${done} element${done === 1 ? '' : 's'}.`);
+    afterEdit();
+  });
+}
+
+function wireEditingUI() {
+  el.btnSetValue.addEventListener('click', openLegendEdit);
+  el.btnExportIfc.addEventListener('click', exportEdits);
+  el.btnDiscardEdits.addEventListener('click', discardEdits);
+}
+
+// ------------------------------------------------------------------ BCF issues
+
+/** The open BCF: imported topics plus the ones raised here. */
+let bcf = { topics: [], extra: new Map(), version: '2.1' };
+let bcfSelected = null;
+const AUTHOR_KEY = 'rsp-ifcsg.author';
+
+function bcfAuthor() {
+  return (el.bcfAuthor.value || '').trim() || 'RSP IFC-SG Viewer';
+}
+
+const TYPE_CHIP = { fail: 'fail', error: 'fail', alert: 'alert', warning: 'alert', info: 'info' };
+const STATUSES = ['Active', 'Resolved', 'Closed'];
+
+function renderBcfList() {
+  el.btnBcfExport.disabled = !bcf.topics.length;
+  if (!bcf.topics.length) {
+    el.bcfList.innerHTML = '<div class="empty-note">No issues yet. Import a BCF from the CORENET X Model Checker, raise a topic on a selected element, or turn check findings into topics with “To BCF” on the Compliance tab.</div>';
+    el.bcfDetail.classList.remove('visible');
+    return;
+  }
+  el.bcfList.innerHTML = bcf.topics.map((t) => {
+    const typeChip = t.type ? `<span class="chip ${TYPE_CHIP[t.type.toLowerCase()] || ''}">${esc(t.type)}</span>` : '';
+    const done = /resolved|closed/i.test(t.status || '');
+    const statusChip = t.status ? `<span class="chip${done ? ' done' : ''}">${esc(t.status)}</span>` : '';
+    const when = t.created ? new Date(t.created).toLocaleDateString() : '';
+    return `<div class="bcf-row${t.guid === bcfSelected ? ' active' : ''}" data-guid="${esc(t.guid)}">
+      <div class="bt">${esc(t.title)}<small>${esc([t.author, when, t.comments.length ? `${t.comments.length} comment${t.comments.length === 1 ? '' : 's'}` : ''].filter(Boolean).join(' · '))}</small></div>
+      <div class="chips">${typeChip}${statusChip}</div>
+    </div>`;
+  }).join('');
+  el.bcfList.querySelectorAll('.bcf-row').forEach((row) => {
+    row.addEventListener('click', () => selectTopic(row.dataset.guid));
+  });
+}
+
+function selectTopic(guid) {
+  bcfSelected = guid;
+  renderBcfList();
+  const topic = bcf.topics.find((t) => t.guid === guid);
+  if (!topic) return;
+  renderBcfDetail(topic);
+  showTopicInModel(topic);
+}
+
+/** Every element GUID a topic points at: its viewpoints, then its description. */
+function topicGuids(topic) {
+  const out = new Set();
+  for (const v of topic.viewpoints) for (const g of v.selection) out.add(g);
+  // The Model Checker writes the GUID into the description; catch that too.
+  for (const m of (topic.description || '').matchAll(/\b([0-9A-Za-z_$]{22})\b/g)) out.add(m[1]);
+  return [...out];
+}
+
+/** Resolves GUIDs to drawable elements, through the index or the file text. */
+async function resolveGuids(guids) {
+  const found = [];
+  const missing = [];
+  for (const g of guids) {
+    const el_ = index && index.byGuid.get(g);
+    if (el_) found.push(el_);
+    else missing.push(g);
+  }
+  if (missing.length && viewer && viewer.hasModels) {
+    for (const entry of viewer.entries) {
+      if (!entry.file) continue;
+      let scan;
+      try {
+        scan = await textScanFor(entry.modelID);
+      } catch {
+        continue;
+      }
+      for (const g of [...missing]) {
+        const id = scan.guidToId.get(g);
+        if (id === undefined) continue;
+        // Not in the index, but drawable: a bare element record is enough to colour it.
+        found.push({ modelID: entry.modelID, expressID: id, key: `${entry.modelID}:${id}`, globalId: g, parts: [], name: g, entity: 'Element' });
+        missing.splice(missing.indexOf(g), 1);
+      }
+    }
+  }
+  return { found, missing };
+}
+
+async function showTopicInModel(topic) {
+  if (!viewer || !viewer.hasModels) return;
+  const guids = topicGuids(topic);
+  const { found, missing } = await resolveGuids(guids);
+  const vp = topic.viewpoints.find((v) => v.camera);
+  if (found.length) {
+    shellActions.showInModel([{ label: topic.title, colour: 0xd16a4f, elements: found }], 'Issue', topic.title);
+    if (!vp) viewer.fitElements(found);
+  }
+  if (vp && vp.camera) viewer.setViewpoint(vp.camera);
+  if (missing.length && !found.length) {
+    toast(guids.length
+      ? `None of this topic's ${guids.length} element${guids.length === 1 ? '' : 's'} are in the loaded models.`
+      : 'This topic does not name any element.');
+  }
+}
+
+function renderBcfDetail(topic) {
+  const statuses = [...new Set([...STATUSES, topic.status].filter(Boolean))];
+  const snap = topic.viewpoints.find((v) => v.snapshotData);
+  const snapUrl = snap ? URL.createObjectURL(new Blob([snap.snapshotData], { type: 'image/png' })) : null;
+  el.bcfDetail.innerHTML = `
+    <div class="bd-title">${esc(topic.title)}</div>
+    <div class="bd-meta">${esc([topic.type, topic.author, topic.created ? new Date(topic.created).toLocaleString() : ''].filter(Boolean).join(' · '))}</div>
+    ${topic.description ? `<div class="bd-desc">${esc(topic.description)}</div>` : ''}
+    ${snapUrl ? `<img class="bd-snap" src="${snapUrl}" alt="Snapshot" />` : ''}
+    <div class="bd-row"><span>Status</span><select data-status>${statuses.map((s) =>
+      `<option${s === topic.status ? ' selected' : ''}>${esc(s)}</option>`).join('')}</select></div>
+    <div class="bd-row"><span>Assigned</span><input data-assigned value="${esc(topic.assignedTo || '')}" placeholder="name or email" /></div>
+    ${topic.comments.map((c) => `<div class="bd-comment">${esc(c.text)}<small>${esc(c.author)} · ${esc(c.date ? new Date(c.date).toLocaleString() : '')}</small></div>`).join('')}
+    <textarea data-comment placeholder="Add a comment…"></textarea>
+    <div class="bd-actions">
+      <button class="btn sm" data-show>Show in model</button>
+      <button class="btn sm" data-comment-add>Comment</button>
+      <span class="spacer"></span>
+      <button class="btn sm" data-delete title="Remove this topic from the file">Delete</button>
+    </div>`;
+  el.bcfDetail.classList.add('visible');
+
+  el.bcfDetail.querySelector('[data-status]').addEventListener('change', (e) => {
+    topic.status = e.target.value;
+    touchTopic(topic, bcfAuthor());
+    renderBcfList();
+  });
+  el.bcfDetail.querySelector('[data-assigned]').addEventListener('change', (e) => {
+    topic.assignedTo = e.target.value.trim() || null;
+    touchTopic(topic, bcfAuthor());
+  });
+  el.bcfDetail.querySelector('[data-show]').addEventListener('click', () => showTopicInModel(topic));
+  el.bcfDetail.querySelector('[data-comment-add]').addEventListener('click', () => {
+    const box = el.bcfDetail.querySelector('[data-comment]');
+    const text = box.value.trim();
+    if (!text) return;
+    topic.comments.push(newComment(bcfAuthor(), text));
+    touchTopic(topic, bcfAuthor());
+    renderBcfDetail(topic);
+    renderBcfList();
+  });
+  el.bcfDetail.querySelector('[data-delete]').addEventListener('click', () => {
+    if (!window.confirm(`Delete the topic "${topic.title}"?`)) return;
+    bcf.topics = bcf.topics.filter((t) => t !== topic);
+    bcfSelected = null;
+    el.bcfDetail.classList.remove('visible');
+    renderBcfList();
+  });
+}
+
+async function importBcfFile(file) {
+  try {
+    const parsed = await readBcf(await file.arrayBuffer());
+    const byGuid = new Map(bcf.topics.map((t) => [t.guid, t]));
+    let added = 0, replaced = 0;
+    for (const t of parsed.topics) {
+      if (byGuid.has(t.guid)) { replaced++; bcf.topics[bcf.topics.indexOf(byGuid.get(t.guid))] = t; }
+      else { added++; bcf.topics.push(t); }
+    }
+    for (const [k, v] of parsed.extra) if (!bcf.extra.has(k)) bcf.extra.set(k, v);
+    bcf.version = parsed.version || bcf.version;
+    renderBcfList();
+    showTab('issues');
+    toast(`${file.name}: ${added} topic${added === 1 ? '' : 's'} imported${replaced ? `, ${replaced} updated` : ''}.`);
+  } catch (err) {
+    console.error(err);
+    toast(`${file.name}: ${err.message}`);
+  }
+}
+
+/** A topic raised by hand on the element the inspector shows, with a snapshot. */
+async function newTopicFromSelection() {
+  const elements = lastPicked ? [lastPicked]
+    : legend.filter((g, i) => soloIndex < 0 || soloIndex === i).flatMap((g) => g.elements);
+  const guids = elements.map((e) => e.globalId).filter(Boolean);
+  const modelName = lastPicked ? (viewer.models.get(lastPicked.modelID)?.name || '') : '';
+  el.bcfDetail.innerHTML = `
+    <div class="bd-form">
+      <div class="bd-title">New topic${lastPicked ? ` on ${esc(lastPicked.name || lastPicked.entity)}` : ''}</div>
+      <div class="bd-row"><span>Title</span><input data-title placeholder="What is wrong" /></div>
+      <div class="bd-row"><span>Type</span><select data-type><option>Issue</option><option>Fail</option><option>Alert</option><option>Info</option></select></div>
+      <div class="bd-row"><span>Details</span><textarea data-desc placeholder="Optional description"></textarea></div>
+      <div class="bd-meta">${guids.length ? `${guids.length} element${guids.length === 1 ? '' : 's'} attached, with a snapshot of the current view.` : 'No element selected: the topic will carry the camera only.'}</div>
+      <div class="bd-actions"><button class="btn sm primary" data-create>Create</button><button class="btn sm" data-cancel>Cancel</button></div>
+    </div>`;
+  el.bcfDetail.classList.add('visible');
+  el.bcfDetail.querySelector('[data-title]').focus();
+  el.bcfDetail.querySelector('[data-cancel]').addEventListener('click', () => el.bcfDetail.classList.remove('visible'));
+  el.bcfDetail.querySelector('[data-create]').addEventListener('click', async () => {
+    const title = el.bcfDetail.querySelector('[data-title]').value.trim();
+    if (!title) { toast('Give the topic a title.'); return; }
+    const type = el.bcfDetail.querySelector('[data-type]').value;
+    const description = el.bcfDetail.querySelector('[data-desc]').value.trim();
+    const topic = newTopic({
+      title, type, description, author: bcfAuthor(),
+      files: viewer.entries.map((e) => e.name),
+    });
+    let snapshotData = null;
+    try {
+      const png = await viewer.snapshot();
+      snapshotData = png ? new Uint8Array(await png.arrayBuffer()) : null;
+    } catch { snapshotData = null; }
+    topic.viewpoints.push(newViewpoint({ selection: guids, camera: viewer.cameraViewpoint(), snapshotData }));
+    if (modelName && !description) topic.description = guids.map((g) => `${g}; ${modelName}`).join('\n');
+    bcf.topics.push(topic);
+    selectTopic(topic.guid);
+  });
+}
+
+/** Every failing or warning finding of the last run becomes a topic, in MC's description format. */
+function findingsToBcf() {
+  const files = viewer.entries.map((e) => e.name);
+  const modelName = new Map(viewer.entries.map((e) => [e.modelID, e.name]));
+  let n = 0;
+  const CAP = 2000;
+  for (const outcome of checkOutcomes) {
+    const meta = registry.byId(outcome.id);
+    if (!outcome.result || !meta) continue;
+    for (const f of outcome.result.findings || []) {
+      if (f.severity !== SEVERITY.FAIL && f.severity !== SEVERITY.WARN) continue;
+      if (n >= CAP) break;
+      const element = f.element || {};
+      const guid = element.globalId || '';
+      const topic = newTopic({
+        title: `${meta.title}: ${f.label || f.code}`,
+        type: f.severity === SEVERITY.FAIL ? 'Fail' : 'Alert',
+        description: [f.rule || meta.title, f.message || f.label, guid, modelName.get(element.modelID) || '']
+          .filter(Boolean).join('; '),
+        author: bcfAuthor(),
+        files,
+      });
+      if (guid) topic.viewpoints.push(newViewpoint({ selection: [guid] }));
+      bcf.topics.push(topic);
+      n++;
+    }
+  }
+  renderBcfList();
+  showTab('issues');
+  toast(n >= CAP
+    ? `${CAP} topics created; the rest were left out to keep the file manageable.`
+    : `${n} topic${n === 1 ? '' : 's'} created from the check findings.`);
+}
+
+async function exportBcf() {
+  if (!bcf.topics.length) return;
+  try {
+    const blob = await writeBcf(bcf);
+    const base = project && project.project.code ? project.project.code : 'issues';
+    await saveBlob(blob, `${base}.bcf`, [{ description: 'BCF', accept: { 'application/octet-stream': ['.bcf', '.bcfzip'] } }]);
+    toast(`${bcf.topics.length} topic${bcf.topics.length === 1 ? '' : 's'} written.`);
+  } catch (err) {
+    if (err && err.name === 'AbortError') return;
+    console.error(err);
+    toast('The BCF could not be written: ' + err.message);
+  }
+}
+
+function wireBcfUI() {
+  try {
+    el.bcfAuthor.value = localStorage.getItem(AUTHOR_KEY) || '';
+  } catch { /* storage blocked */ }
+  el.bcfAuthor.addEventListener('change', () => {
+    try { localStorage.setItem(AUTHOR_KEY, el.bcfAuthor.value.trim()); } catch { /* ignore */ }
+  });
+  el.btnBcfImport.addEventListener('click', () => el.bcfInput.click());
+  el.bcfInput.addEventListener('change', (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (file) importBcfFile(file);
+    e.target.value = '';
+  });
+  el.btnBcfNew.addEventListener('click', newTopicFromSelection);
+  el.btnBcfExport.addEventListener('click', exportBcf);
+  renderBcfList();
+}
+
+// -------------------------------------------------------------- model records
+
+/**
+ * A project keeps one record per model it has checked: what the file is, what
+ * the dashboard measured, how each check came out and what it found. That is
+ * what lets a four-file submission be checked one file at a time on a machine
+ * that cannot hold them all, and still add up.
+ *
+ * Records are matched to files by content, never by name — see model-id.js.
+ */
+
+/** Findings kept per model. Beyond this the record stores a count. */
+const FINDINGS_PER_MODEL = 3000;
+
+const RECORD_STATE = {
+  MATCH: 'match',       // loaded, and the record describes this same file
+  RENAMED: 'renamed',   // loaded and matched, but the record has another name
+  UPDATED: 'updated',   // loaded and matched, but the file has been re-issued
+  NEW: 'new',           // loaded, no record yet
+  MISSING: 'missing',   // recorded, not loaded now
+  LEGACY: 'legacy',     // a name from a version 1 project, never checked here
+};
+
+const STATE_LABEL = {
+  [RECORD_STATE.MATCH]: 'Loaded · recorded',
+  [RECORD_STATE.RENAMED]: 'Renamed',
+  [RECORD_STATE.UPDATED]: 'Re-issued',
+  [RECORD_STATE.NEW]: 'Loaded · not recorded',
+  [RECORD_STATE.MISSING]: 'Not loaded',
+  [RECORD_STATE.LEGACY]: 'Expected',
+};
+
+/** The per-model dashboard rows, from the merged dashboard's per-file split. */
+function dashboardForModel(dash, name) {
+  if (!dash) return [];
+  return dash.metrics.map((m) => {
+    const row = m.byFile.find((r) => r.label === name);
+    return {
+      id: m.id, title: m.title, unit: m.unit, decimals: m.decimals, isCount: m.isCount,
+      total: row ? row.value : 0, count: row ? row.count : 0,
+    };
+  });
+}
+
+/**
+ * One model's record, built from the last check run.
+ * @param {object} entry     the viewer entry
+ * @param {object|null} prev an existing record to update in place
+ * @param {object|null} dash the merged dashboard, computed once per capture
+ */
+function buildModelRecord(entry, prev, dash) {
+  const idx = indexes.get(entry.modelID);
+  const identity = identities.get(entry.modelID) || (prev && prev.identity) || null;
+  // A finding about the submission rather than an element (file size, levels
+  // across files) carries no element. It can only be attributed to a file when
+  // that file was the only one open.
+  const alone = viewer.entries.length === 1;
+
+  const checks = [];
+  const findings = [];
+  let truncated = 0;
+
+  for (const o of checkOutcomes) {
+    const meta = o.meta || registry.byId(o.id);
+    if (!meta) continue;
+    if (o.error) {
+      checks.push({ id: o.id, title: meta.title, authority: meta.authority, status: 'error',
+        fail: 0, warn: 0, elements: null, assertions: null, pass: null, scope: alone ? 'file' : 'shared' });
+      continue;
+    }
+    let fail = 0;
+    let warn = 0;
+    const touched = new Set();
+    for (const f of o.result.findings || []) {
+      const mine = f.element ? f.element.modelID === entry.modelID : alone;
+      if (!mine) continue;
+      if (f.element) touched.add(f.element.key);
+      if (f.severity === SEVERITY.FAIL) fail++;
+      else if (f.severity === SEVERITY.WARN) warn++;
+      else continue;
+      if (findings.length < FINDINGS_PER_MODEL) {
+        findings.push({
+          check: o.id,
+          guid: f.element ? (f.element.globalId || null) : null,
+          name: f.element ? (f.element.name || f.element.entity || null) : null,
+          entity: f.element ? f.element.entity || null : null,
+          severity: f.severity,
+          code: f.code || null,
+          label: f.label || null,
+          message: f.message || null,
+          rule: f.rule || null,
+        });
+      } else {
+        truncated++;
+      }
+    }
+    const s = o.result.summary || {};
+    checks.push({
+      id: o.id, title: meta.title, authority: meta.authority,
+      status: fail ? 'fail' : warn ? 'warn' : (alone && !s.assertions) ? 'empty' : 'pass',
+      fail, warn,
+      // Only meaningful for a file checked on its own; otherwise the run's
+      // totals cover every file and cannot be split.
+      elements: alone ? (s.elements || 0) : touched.size,
+      assertions: alone ? (s.assertions || 0) : null,
+      pass: alone ? (s.pass || 0) : null,
+      scope: alone ? 'file' : 'shared',
+    });
+  }
+
+  const g = idx && idx.georef;
+  return {
+    id: (prev && prev.id) || 'm' + (Date.now().toString(36) + Math.random().toString(36).slice(2, 6)),
+    name: entry.name,
+    identity,
+    checkedAt: checkOutcomes.length ? new Date().toISOString() : (prev ? prev.checkedAt : null),
+    rulesetGenerated: ruleset ? ruleset.meta.generated : null,
+    elements: idx ? idx.count : 0,
+    storeys: idx ? idx.storeys.map((s) => ({ name: s.name, elevation: s.elevation, globalId: s.globalId || null })) : [],
+    georef: g ? {
+      hasMapConversion: !!g.mapConversion,
+      eastings: g.mapConversion ? g.mapConversion.eastings : null,
+      northings: g.mapConversion ? g.mapConversion.northings : null,
+      rotation: g.mapConversion ? g.mapConversion.rotation : null,
+      crs: g.crs ? g.crs.name || null : null,
+      lengthUnit: g.lengthUnitName || null,
+    } : null,
+    dashboard: dashboardForModel(dash, entry.name),
+    checks,
+    findings,
+    findingsTruncated: truncated,
+    legacy: false,
+  };
+}
+
+/**
+ * Writes a record for every loaded model into the project, matching each file
+ * to any record it already has by content.
+ * @returns {number} how many models were recorded
+ */
+function captureModelRecords() {
+  if (!viewer.hasModels) return 0;
+  if (!project) project = emptyProject();
+  const dash = index ? computeDashboard(index, new Map(viewer.entries.map((e) => [e.modelID, e.name]))) : null;
+
+  const records = project.models ? [...project.models] : [];
+  // One record per file: a record already claimed by an earlier file in this
+  // pass cannot be claimed again, however well it scores.
+  const claimed = new Set();
+  for (const entry of viewer.entries) {
+    const identity = identities.get(entry.modelID);
+    const hit = identity
+      ? bestMatch(identity, records.filter((r) => r.identity && !claimed.has(r)))
+      : { record: null };
+    // Fall back to the name only for a version 1 record, which has no identity
+    // to match against.
+    const legacy = !hit.record && records.find((r) => r.legacy && !claimed.has(r) && r.name === entry.name);
+    const prev = hit.record || legacy || null;
+    if (prev) claimed.add(prev);
+    const record = buildModelRecord(entry, prev, dash);
+    const at = prev ? records.indexOf(prev) : -1;
+    if (at >= 0) records[at] = record;
+    else records.push(record);
+  }
+  project.models = records;
+  renderProjectChip();
+  renderProjectPanel();
+  return viewer.entries.length;
+}
+
+/**
+ * Loaded models and stored records, side by side: what matched, what was
+ * renamed, what has been re-issued and what is missing.
+ * @returns {Array<{state: string, name: string, recordName: string|null,
+ *   record: object|null, modelID: number|null, reasons: string[], match: object|null}>}
+ */
+function reconcileModels() {
+  const records = (project && project.models) || [];
+  const rows = [];
+  const used = new Set();
+
+  for (const entry of viewer.entries) {
+    const identity = identities.get(entry.modelID) || null;
+    const hit = identity ? bestMatch(identity, records.filter((r) => r.identity && !used.has(r))) : { record: null, confidence: MATCH.NONE, reasons: [] };
+    let record = hit.record;
+    let reasons = hit.reasons || [];
+    if (!record) {
+      // A version 1 record carries a name and nothing else.
+      const legacy = records.find((r) => r.legacy && !used.has(r) && r.name === entry.name);
+      if (legacy) { record = legacy; reasons = ['matched by file name only']; }
+    }
+    if (!record) {
+      rows.push({ state: RECORD_STATE.NEW, name: entry.name, recordName: null, record: null,
+        modelID: entry.modelID, reasons: [], match: null, identity });
+      continue;
+    }
+    used.add(record);
+    const revision = compareRevision(record.identity, identity);
+    const state = revision.changed ? RECORD_STATE.UPDATED
+      : record.name !== entry.name ? RECORD_STATE.RENAMED
+        : RECORD_STATE.MATCH;
+    rows.push({
+      state, name: entry.name, recordName: record.name, record, modelID: entry.modelID,
+      reasons: state === RECORD_STATE.UPDATED ? revision.reasons : reasons,
+      match: hit.record ? hit : null, identity,
+    });
+  }
+
+  for (const record of records) {
+    if (used.has(record)) continue;
+    rows.push({
+      state: record.legacy ? RECORD_STATE.LEGACY : RECORD_STATE.MISSING,
+      name: record.name, recordName: record.name, record, modelID: null, reasons: [], match: null, identity: null,
+    });
+  }
+  return rows;
+}
+
+/** The one line under a model's name in the project panel. */
+function modelSubtitle(row) {
+  const r = row.record;
+  if (!r) {
+    return row.identity && row.identity.headerName && row.identity.headerName !== row.name
+      ? `exported as ${row.identity.headerName} · not recorded yet`
+      : 'not recorded yet';
+  }
+  const bits = [];
+  if (row.state === RECORD_STATE.RENAMED) bits.push(`recorded as ${r.name}`);
+  if (r.checkedAt) {
+    const fails = (r.checks || []).reduce((s, c) => s + (c.fail || 0), 0);
+    const warns = (r.checks || []).reduce((s, c) => s + (c.warn || 0), 0);
+    bits.push(`checked ${new Date(r.checkedAt).toLocaleDateString()}`);
+    bits.push(`${fails} fail, ${warns} warn`);
+  } else if (r.legacy) {
+    bits.push('from an earlier project file');
+  } else {
+    bits.push('recorded, not checked');
+  }
+  if (r.elements) bits.push(`${r.elements} elements`);
+  return bits.join(' · ');
+}
+
+/** Totals across every record, loaded or not — the submission as a whole. */
+function submissionTotals() {
+  const records = (project && project.models) || [];
+  const checked = records.filter((r) => r.checkedAt);
+  let fail = 0;
+  let warn = 0;
+  for (const r of checked) {
+    for (const c of r.checks || []) { fail += c.fail || 0; warn += c.warn || 0; }
+  }
+  const dates = checked.map((r) => r.checkedAt).sort();
+  return {
+    models: records.length,
+    checked: checked.length,
+    elements: records.reduce((s, r) => s + (r.elements || 0), 0),
+    fail, warn,
+    oldest: dates[0] || null,
+    newest: dates[dates.length - 1] || null,
+  };
+}
+
+/** Dashboard metrics summed across every record, for the whole submission. */
+function submissionDashboard() {
+  const rows = new Map();
+  for (const r of (project && project.models) || []) {
+    for (const m of r.dashboard || []) {
+      let row = rows.get(m.id);
+      if (!row) rows.set(m.id, (row = { id: m.id, title: m.title, unit: m.unit, decimals: m.decimals, isCount: m.isCount, total: 0, count: 0, files: 0 }));
+      row.total += m.total || 0;
+      row.count += m.count || 0;
+      if (m.count) row.files++;
+    }
+  }
+  return [...rows.values()];
+}
+
+// ------------------------------------------------------------ readiness report
+
+/**
+ * The submission readiness PDF: the last run's outcomes, the project context,
+ * a snapshot of the current view, and the hand-edit log, built without any
+ * library (see report/pdf.js) and saved through the same picker as everything else.
+ */
+async function makeReport() {
+  if (!checkOutcomes.length) {
+    toast('Run the checks first; the report is built from their results.');
+    return;
+  }
+  el.btnReport.disabled = true;
+  try {
+    let snapshot = null;
+    try {
+      const jpeg = viewer.hasModels ? await viewer.snapshot(1000, 'image/jpeg', 0.82) : null;
+      if (jpeg) snapshot = { bytes: new Uint8Array(await jpeg.arrayBuffer()), width: jpeg.width, height: jpeg.height };
+    } catch (err) {
+      console.warn('No snapshot for the report:', err);
+    }
+    const ranIds = new Set(checkOutcomes.map((o) => o.id));
+    const bytes = buildReadinessReport({
+      project,
+      models: viewer.entries.map((e) => ({
+        name: e.name, bytes: e.bytes,
+        elements: indexes.has(e.modelID) ? indexes.get(e.modelID).count : 0,
+      })),
+      outcomes: checkOutcomes,
+      notRun: registry.all().filter((c) => !ranIds.has(c.id)),
+      ruleset: ruleset ? { source: ruleset.meta.source, generated: ruleset.meta.generated } : {},
+      author: (el.bcfAuthor.value || '').trim(),
+      snapshot,
+      edits: editLogsByFile(project ? project.edits || {} : {}),
+      scope: {
+        gateway: gatewayFilter || GATEWAY.CONSTRUCTION,
+        authorities: projectAuthorities ? [...projectAuthorities] : [],
+      },
+    });
+    const base = project && project.project.code ? project.project.code : 'submission';
+    await saveBlob(new Blob([bytes], { type: 'application/pdf' }), `${base}-readiness-report.pdf`,
+      [{ description: 'PDF', accept: { 'application/pdf': ['.pdf'] } }]);
+    toast('Readiness report written.');
+  } catch (err) {
+    if (!(err && err.name === 'AbortError')) {
+      console.error(err);
+      toast('The report could not be written: ' + err.message);
+    }
+  } finally {
+    el.btnReport.disabled = !checkOutcomes.length;
   }
 }
 

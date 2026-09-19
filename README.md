@@ -70,6 +70,178 @@ indices rather than rebuilding the model, so it stays instant on large files, an
 it leaves the colour overlays untouched (they read from a separate pristine
 index cache).
 
+## Project settings file
+
+A project is "what we are submitting, to whom, at which gateway". Those three
+facts decide most of a compliance run, so they are kept in one file next to the
+IFC set, `<code>.ifcsg-project.json`, rather than re-entered every session.
+
+Open the **project chip** in the top bar (or **New project** / **Open project
+file…** on the start card) to fill it in:
+
+- **Code, name, developer, cadastral lots** — identity, for the chip and the
+  recent list.
+- **Submission gateway** — Design or Construction. One setting drives both the
+  query tab's gateway filter and the URA check's own gateway selector, so the
+  two can no longer disagree.
+- **Authorities in scope** — which agencies this submission goes to. The query
+  tab shows only those authorities, the IFC values check runs only their
+  requirements, and ticking or unticking an authority ticks or unticks its
+  checks on the Compliance tab. Nothing ticked means every authority.
+- **Checks** — the ticked checks and every input they were given are saved
+  with the project. The cadastral lot GeoJSON is embedded as text, so the file
+  is self-contained and survives being emailed. Which shared value presets are
+  ticked is recorded too (by id; the preset definitions stay in
+  `data/value-presets.json`).
+- **Model files** — the loaded models are recorded on save, and the panel shows
+  which of them are loaded next time, so a federated set missing its SITE file
+  is visible before a geo-referencing run.
+
+**Save** writes the file in place in Chrome and Edge (the browser asks where
+once); other browsers download it. **Save as…** picks a new location. The chip
+shows an amber dot while the state differs from the file. Drop a project file
+onto the window, on its own or together with the IFCs, and it is applied before
+the models index. The last project used is also remembered in the browser and
+restored on the next visit; the start card lists the five most recent.
+
+Not in the file: hidden elements, section cuts and colours. Those are session
+scratch. The workbook stamp the project was saved against is recorded, and a
+project saved against a different ruleset gets a one-line warning when it loads.
+
+### Model records
+
+Every run writes a record per loaded model into the project: what the file is,
+the dashboard quantities it contributed, how each check came out and what each
+one found. A four-file submission can therefore be checked one file at a time,
+on a machine that cannot hold them all at once, and the project still knows the
+totals for the whole thing. The **Models** list in the project panel shows what
+is recorded, what is loaded now and what has changed.
+
+**Records are matched to files by content, never by file name.** Submission
+files are renamed constantly — the ADM1 test file is `…-BLDG-55.ifc` on disk
+while its own header still says `…-BLDG-01.ifc` — and a re-export keeps the
+name while changing everything inside. So each record carries an identity taken
+from the model itself (`js/model-id.js`):
+
+- **An element sketch**, the identity proper: the 256 smallest hashes of the
+  model's element GlobalIds. Revit derives those ids from element UniqueIds, so
+  the same model re-exported keeps nearly all of them while a different model
+  shares almost none. Measured on the sample files, two different blocks of one
+  project overlap by 0.0003 and a file with itself by 1. It costs about 2 KB.
+- **Site, building and storey GlobalIds**, as corroboration and as the fallback
+  for older records. They cannot identify a file on their own: blocks exported
+  from one Revit model share the site, the building shell and often several
+  levels.
+- **IfcProject and Revit ContentGUID**, which are shared across every file of a
+  project, so they are recorded but never matched on.
+- **VersionGUID, save number, export timestamp, size and element count**, which
+  move on every save and so say whether a matched file has been re-issued.
+
+The panel labels each model accordingly:
+
+| Label | Meaning |
+| --- | --- |
+| Loaded · recorded | The file open now is the one in the record. |
+| Renamed | Same model, different file name. One click accepts the new name. |
+| Re-issued | Same model, saved again since it was recorded. Re-run the checks to refresh it. |
+| Loaded · not recorded | No record yet; run the checks. |
+| Not loaded | Recorded earlier, not open now. Its numbers still count. |
+
+Findings are the bulk of a project file, so each record keeps at most 3000 and
+counts the rest, and the copy kept in the browser's recent list drops them
+entirely.
+
+The format is `js/project.js`; a hand-edited or older file loads with defaults
+for whatever it leaves out.
+
+## Editing the IFC
+
+Last-mile fixes, made in the viewer and written to a copy of the file: set a
+property a check found missing or wrong, change any value the inspector shows,
+rename a storey, or set one property on every element a query selected.
+
+- In the **element inspector**, a failing IFC-SG requirement has a **Fix**
+  button and every property row has **Edit**. Booleans and enumerated values
+  come as a list of the accepted values; everything else is a text box.
+  **Rename** changes the element's Name attribute — how a storey is renamed.
+- In the **query legend**, a property query shows **Set value…**, which writes
+  one value onto every element the legend lists (a soloed row narrows it).
+- The **edits bar** at the bottom counts pending edits. **Export IFC** writes
+  `<name>-edited.ifc` for each edited file; **Discard** forgets them.
+
+How it writes. The file the browser holds is scanned once for where every
+entity line starts and ends (`js/ifc-text.js`). Each edit becomes a patch on
+one line, or new lines appended before the DATA section closes. Export slices
+the original bytes around the patches, so untouched lines are byte-identical
+and a 170 MB file is never copied whole. Before the download the changed
+lines are re-parsed by web-ifc on a small file made of just them.
+
+**Clone on shared.** Revit writes a property value once and references it from
+every property set that carries the same value, and attaches one property set
+to many elements through a single relationship. Changing such a line in place
+would change every element sharing it. So a property set or property is cloned
+for the element being edited whenever anything else still refers to it, and
+the shared original is left alone (`js/ifc-edit/editor.js`).
+
+Edits live in the IFC only: the next export from Revit overwrites them. The
+project file records a log of them by file so the team can see what was
+changed by hand.
+
+## Issues (BCF)
+
+The **Issues** tab reads and writes BCF 2.1, the format the CORENET X Model
+Checker returns and that Revit and BCF viewers open. No library: the zip
+container and the XML are handled in `js/bcf/`.
+
+- **Import BCF…** (or drop a `.bcf` on the window) lists the topics. Selecting
+  one colours the elements it names — from its viewpoint, or from the GUID the
+  Model Checker writes into the description — and moves the camera to the
+  viewpoint where there is one. An element the index did not keep (a column,
+  a beam) is still found, by GUID, in the file text.
+- Status, assignee and comments are editable; every change is stamped with the
+  author named at the top of the tab.
+- **New topic** raises a topic on the element the inspector shows (or the
+  query selection), with the current camera and a snapshot of the view.
+- **To BCF** on the Compliance tab turns every failing or warning finding of
+  the last run into a topic, in the Model Checker's own description format:
+  requirement; message; element GUID; file name. Fail and Alert map to our
+  fail and warn.
+- **Export BCF** writes everything. Imported topics keep their original XML
+  with only the edited fields changed, and files in the archive the panel does
+  not understand are copied through unchanged.
+
+## Submission readiness report (PDF)
+
+**PDF report** on the Compliance tab, after a run, writes
+`<code>-readiness-report.pdf`: a record that the models were checked and
+whether they are ready to submit. It is built from the run's outcomes alone
+(`js/report/report.js`), so every check present or future reports the same way,
+and written by a small PDF writer with no library (`js/report/pdf.js`).
+
+What it contains, in order:
+
+1. **Verdict banner** — READY FOR SUBMISSION, or NOT READY with the failure
+   and warning counts. Ready means every selected check ran and produced no
+   failure; warnings are listed but do not block.
+2. **Project** — code, development, developer, lots, gateway, authorities in
+   scope, the IFC-SG workbook the checks used, who prepared it (the Author
+   field on the Issues tab), and when.
+3. **Snapshot** of the current view.
+4. **Model files checked** — name, size, elements indexed.
+5. **Checks** — one row per check with elements, assertions, pass, fail, warn
+   and a result; checks that were not selected are listed as not run, so the
+   verdict's scope is explicit.
+6. **Per check** — rule-by-rule results for the rule-based checks (URA, BCA),
+   with the guide reference; component-by-component failure counts and the
+   most frequent issue for the IFC values check.
+7. **Outstanding failures** — up to 150 rows with element and GlobalId, then a
+   pointer to the BCF export for the rest. **Warnings** follow.
+8. **Edits made in the viewer**, if any, with a reminder that they live in the
+   IFC copy only.
+9. **Declaration** and signature lines for the preparer and the reviewing QP.
+   The wording mirrors the CORENET X Model Checker guide: the report supplements
+   the QP's review and does not replace it.
+
 ## Project dashboard
 
 The **Dashboard** button totals the headline quantities across the whole
@@ -293,6 +465,24 @@ disagree**:
 URA accepts and the workbook lacks live in `data/ura-vocabulary.json` and are
 merged at load. Both `AST_AreaType` spellings are accepted rather than guessing
 which one a reviewer applies.
+
+### Space geometry
+
+Every IfcSpace must carry a geometric representation. A room Revit could not
+enclose, or an area never placed, exports as an IfcSpace with
+`Representation = $`: it keeps its number, name and properties, so the property
+checks pass over it, but the authorities cannot see it, measure it or tag it,
+and an Area_GFA space without geometry drops out of the GFA computation.
+
+This is the one condition the community
+[IFC Space Geometry Checker](https://noddlesskcho.github.io/IFC-Space-Geometry-Checker/)
+tests, folded in as a check (`js/checks/space-geometry/`) so it runs with
+everything else and lands in the BCF export and the readiness report. The index
+records whether each element has a representation at load time, so the check
+itself is a filter. Its table follows that tool's columns — number, name,
+level, predefined type, object type, GUID and the Revit lookup id read from the
+space type's Tag — and downloads as CSV. Clicking a row opens the space's
+properties; there is nothing to colour, since the space has no geometry.
 
 ### Geo-referencing (URA)
 

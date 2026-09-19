@@ -113,6 +113,17 @@ const MANIFEST = [
     experimental: true,
     load: () => import('./bca/index.js'),
   },
+  {
+    id: 'space-geometry',
+    title: 'Space geometry',
+    authority: 'IFC-SG',
+    summary:
+      'Every IfcSpace carries a geometric representation. A room Revit could not ' +
+      'enclose exports with none: it cannot be reviewed or measured, and an Area_GFA ' +
+      'space without geometry drops out of the GFA computation.',
+    requires: { entities: ['IFCSPACE'] },
+    load: () => import('./space-geometry/index.js'),
+  },
 ];
 
 /** Every check, in menu order. */

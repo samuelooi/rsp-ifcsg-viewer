@@ -80,6 +80,87 @@
   .model-picker.open .models-menu { display: block; }
   #topbar .spacer { flex: 1; }
 
+  /* Project chip + panel: the submission context, saved to a file. */
+  .project-picker { position: relative; }
+  .project-chip {
+    display: flex; align-items: center; gap: 7px; max-width: 34vw;
+    font: inherit; font-size: 12.5px; color: var(--text-dim);
+    background: none; border: 1px solid transparent; border-radius: var(--radius);
+    padding: 5px 9px; cursor: pointer;
+  }
+  .project-chip svg { width: 15px; height: 15px; flex-shrink: 0; }
+  .project-chip .pc-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .project-chip .pc-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--warn); flex-shrink: 0; }
+  .project-chip .caret { font-size: 8px; opacity: .6; flex-shrink: 0; }
+  .project-chip:hover, .project-picker.open .project-chip { background: var(--panel-2); border-color: var(--border); }
+  .project-chip.has-project { color: var(--text); }
+  .project-panel {
+    display: none; position: absolute; top: calc(100% + 6px); left: 0; width: 380px; max-height: 75vh;
+    overflow-y: auto; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+    box-shadow: 0 10px 28px rgba(0, 0, 0, .5); z-index: 40;
+  }
+  .project-picker.open .project-panel { display: block; }
+  .project-panel .pp-head {
+    display: flex; align-items: center; justify-content: space-between; padding: 9px 12px;
+    border-bottom: 1px solid var(--border); font-size: 11px; letter-spacing: .04em; color: var(--text-dim);
+  }
+  .project-panel .pp-state { letter-spacing: 0; color: var(--text-muted); }
+  .project-panel .pp-body { padding: 10px 12px 4px; }
+  .project-panel .pp-field { display: block; margin-bottom: 10px; }
+  .project-panel .pp-field > span { display: block; font-size: 10.5px; color: var(--text-muted); margin-bottom: 3px; }
+  .project-panel .pp-field > span small { color: var(--text-dim); margin-left: 4px; }
+  .project-panel .pp-field input, .project-panel .pp-field select {
+    width: 100%; box-sizing: border-box; font: inherit; font-size: 12.5px; color: var(--text);
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 8px;
+  }
+  .project-panel .pp-field input:focus, .project-panel .pp-field select:focus { outline: none; border-color: var(--accent); }
+  .project-panel .pp-note { font-size: 12px; color: var(--text-muted); line-height: 1.45; }
+  .project-panel .pp-note small { display: block; color: var(--text-dim); }
+  .project-panel .pp-models { list-style: none; margin: 0; padding: 0; font-size: 12px; }
+  .project-panel .pp-models li {
+    padding: 6px 0 7px; border-top: 1px solid var(--border);
+  }
+  .project-panel .pp-models .pm-top { display: flex; align-items: baseline; gap: 8px; }
+  .project-panel .pp-models .pm-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .project-panel .pp-models .pm-sub { color: var(--text-dim); font-size: 10.5px; margin-top: 2px; }
+  .project-panel .pp-models .pm-why { color: var(--text-muted); font-size: 10.5px; margin-top: 2px; font-style: italic; }
+  .project-panel .pp-models .pm-act { display: inline-block; margin: 4px 4px 0 0; }
+  .project-panel .pp-models li.st-missing .pm-name,
+  .project-panel .pp-models li.st-legacy .pm-name { color: var(--text-muted); }
+  .project-panel .pp-models li.st-renamed { box-shadow: inset 2px 0 0 var(--warn); padding-left: 8px; }
+  .project-panel .pp-models li.st-updated { box-shadow: inset 2px 0 0 var(--warn); padding-left: 8px; }
+  .chip.alert { background: #4a3d1e; color: #e5c277; border-color: transparent; }
+
+  .project-panel .pp-files { list-style: none; margin: 0; padding: 0; font-size: 12px; }
+  .project-panel .pp-files li { display: flex; justify-content: space-between; gap: 8px; padding: 3px 0; border-top: 1px solid var(--border); }
+  .project-panel .pp-files li small { color: var(--text-dim); flex-shrink: 0; }
+  .project-panel .pp-files li.ok small { color: var(--ok); }
+  .project-panel .pp-files li.missing { color: var(--text-muted); }
+  .project-panel .pp-files li.missing small { color: var(--warn); }
+  .project-panel .pp-actions {
+    display: flex; gap: 6px; align-items: center; padding: 9px 12px; border-top: 1px solid var(--border);
+  }
+  .project-panel .pp-actions .spacer { flex: 1; }
+
+  /* Start card: open, create or resume a project before any model is loaded. */
+  .start-projects { margin-top: 26px; padding-top: 18px; border-top: 1px solid var(--border); text-align: left; }
+  .start-projects .sp-row { display: flex; gap: 8px; justify-content: center; }
+  .start-projects .sp-row .btn { margin: 0; }
+  .start-projects .sp-recent { display: grid; grid-template-columns: 1fr auto; gap: 4px 6px; margin-top: 14px; align-items: center; }
+  .start-projects .sp-recent > span { grid-column: 1 / -1; font-size: 10.5px; letter-spacing: .04em; color: var(--text-dim); }
+  .start-projects .sp-item {
+    display: flex; justify-content: space-between; gap: 10px; align-items: baseline;
+    font: inherit; font-size: 12.5px; color: var(--text); text-align: left;
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 6px 10px; cursor: pointer;
+  }
+  .start-projects .sp-item:hover { border-color: var(--accent); }
+  .start-projects .sp-item small { color: var(--text-dim); white-space: nowrap; }
+  .start-projects .sp-forget {
+    background: none; border: none; color: var(--text-dim); font-size: 14px; cursor: pointer; padding: 2px 5px;
+  }
+  .start-projects .sp-forget:hover { color: var(--text); }
+
   .ruleset-badge {
     font-size: 11px; color: var(--text-dim);
     border: 1px solid var(--border); border-radius: 999px;
@@ -635,6 +716,92 @@
     transition: opacity .18s ease, transform .18s ease; max-width: 460px;
   }
   #toast.visible { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+  /* ---------- IFC editing ---------- */
+  .btn.xs { padding: 2px 7px; font-size: 10.5px; line-height: 1.4; }
+  .chk-row .btn.xs, .prop-row .btn.xs { margin-left: 6px; flex-shrink: 0; }
+  .prop-row .v .btn.xs { vertical-align: middle; }
+  .edit-row {
+    display: flex; gap: 6px; align-items: center; padding: 6px 0 8px 14px;
+    border-top: 1px dashed var(--border);
+  }
+  .edit-row input, .edit-row select {
+    flex: 1; min-width: 0; font: inherit; font-size: 12px; color: var(--text);
+    background: var(--panel-2); border: 1px solid var(--accent); border-radius: var(--radius); padding: 4px 7px;
+  }
+  .edit-row .hint { font-size: 10.5px; color: var(--text-dim); flex-basis: 100%; }
+  .prop-type .btn.xs { margin-left: 8px; vertical-align: middle; }
+  #edits-bar {
+    position: absolute; left: 50%; bottom: 16px; transform: translateX(-50%);
+    display: none; align-items: center; gap: 8px; padding: 8px 12px; z-index: 23;
+    background: var(--panel); border: 1px solid var(--warn); border-radius: var(--radius);
+    box-shadow: 0 6px 22px rgba(0,0,0,.35); font-size: 12.5px;
+  }
+  #edits-bar.visible { display: flex; }
+  #edits-bar .eb-text { color: var(--text); margin-right: 6px; }
+  #edits-bar .eb-text small { display: block; color: var(--text-dim); font-size: 10.5px; }
+  #legend-edit {
+    display: none; gap: 6px; align-items: center; padding: 6px 10px; border-bottom: 1px solid var(--border);
+  }
+  #legend-edit.visible { display: flex; }
+  #legend-edit input, #legend-edit select {
+    flex: 1; min-width: 0; font: inherit; font-size: 12px; color: var(--text);
+    background: var(--panel-2); border: 1px solid var(--accent); border-radius: var(--radius); padding: 4px 7px;
+  }
+
+  /* ---------- Space geometry table ---------- */
+  .sg-table { border-collapse: collapse; font-size: 11px; white-space: nowrap; }
+  .sg-table th, .sg-table td { padding: 4px 8px; border-bottom: 1px solid #2e333c; text-align: left; }
+  .sg-table th { color: var(--text-dim); font-weight: 600; font-size: 10px; letter-spacing: .03em; position: sticky; top: 0; background: var(--panel); }
+  .sg-table tr:hover td { background: var(--panel-2); }
+
+  /* ---------- Issues (BCF) ---------- */
+  .issues-actions { display: flex; gap: 6px; align-items: center; padding: 10px; border-bottom: 1px solid var(--border); }
+  .issues-actions .spacer { flex: 1; }
+  .issues-author {
+    display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-bottom: 1px solid var(--border);
+    font-size: 10.5px; color: var(--text-muted);
+  }
+  .issues-author input {
+    flex: 1; font: inherit; font-size: 12px; color: var(--text); background: var(--panel-2);
+    border: 1px solid var(--border); border-radius: var(--radius); padding: 4px 7px;
+  }
+  #bcf-list { flex: 1; }
+  .bcf-row {
+    display: flex; gap: 8px; align-items: flex-start; padding: 8px 10px; cursor: pointer;
+    border-bottom: 1px solid #2e333c;
+  }
+  .bcf-row:hover { background: var(--panel-2); }
+  .bcf-row.active { background: var(--panel-2); box-shadow: inset 2px 0 0 var(--accent); }
+  .bcf-row .bt { flex: 1; min-width: 0; font-size: 12.5px; }
+  .bcf-row .bt small { display: block; color: var(--text-dim); font-size: 10.5px; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .bcf-row .chips { display: flex; flex-direction: column; gap: 3px; align-items: flex-end; flex-shrink: 0; }
+  .chip { font-size: 10px; padding: 1px 6px; border-radius: 999px; background: var(--panel-2); color: var(--text-muted); border: 1px solid var(--border); white-space: nowrap; }
+  .chip.fail { background: #4a2a22; color: #e59277; border-color: transparent; }
+  .chip.alert { background: #4a3d1e; color: #e5c277; border-color: transparent; }
+  .chip.info { background: #22364a; color: #8fc1e5; border-color: transparent; }
+  .chip.done { background: #27402a; color: #86c086; border-color: transparent; }
+  #bcf-detail {
+    display: none; flex-direction: column; max-height: 55%; overflow-y: auto;
+    border-top: 1px solid var(--border); padding: 10px; font-size: 12.5px; gap: 8px;
+  }
+  #bcf-detail.visible { display: flex; }
+  #bcf-detail .bd-title { font-weight: 600; }
+  #bcf-detail .bd-meta { font-size: 10.5px; color: var(--text-dim); }
+  #bcf-detail .bd-desc { white-space: pre-wrap; color: var(--text-muted); font-size: 12px; line-height: 1.45; }
+  #bcf-detail .bd-row { display: flex; gap: 6px; align-items: center; }
+  #bcf-detail .bd-row > span { font-size: 10.5px; color: var(--text-muted); width: 64px; flex-shrink: 0; }
+  #bcf-detail select, #bcf-detail input, #bcf-detail textarea {
+    flex: 1; min-width: 0; font: inherit; font-size: 12px; color: var(--text); background: var(--panel-2);
+    border: 1px solid var(--border); border-radius: var(--radius); padding: 4px 7px;
+  }
+  #bcf-detail textarea { resize: vertical; min-height: 44px; }
+  #bcf-detail .bd-snap { max-width: 100%; border: 1px solid var(--border); border-radius: var(--radius); }
+  #bcf-detail .bd-comment { border-top: 1px solid #2e333c; padding: 6px 0; }
+  #bcf-detail .bd-comment small { display: block; color: var(--text-dim); font-size: 10.5px; }
+  #bcf-detail .bd-actions { display: flex; gap: 6px; }
+  #bcf-detail .bd-actions .spacer { flex: 1; }
+  #bcf-detail .bd-form { display: flex; flex-direction: column; gap: 6px; }
 </style>
 </head>
 <body>
@@ -655,6 +822,15 @@
       </button>
       <div id="models" class="models-menu"></div>
     </div>
+    <div class="project-picker" id="project-picker">
+      <button id="project-chip" class="project-chip" title="Project settings">
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round">
+          <path d="M3 5.5h5l1.5 2H17v8H3z"/>
+        </svg>
+        <span class="pc-name">No project</span><span class="pc-dot" hidden></span><span class="caret">&#9660;</span>
+      </button>
+      <div id="project-panel" class="project-panel"></div>
+    </div>
     <div class="spacer"></div>
     <div class="mem" id="mem" title="Estimated tab memory">
       <span>Memory</span>
@@ -674,6 +850,7 @@
     <div class="tabs">
       <button data-tab="query" class="active"><span>QUERIES</span></button>
       <button data-tab="check"><span>COMPLIANCE</span></button>
+      <button data-tab="issues"><span>ISSUES</span></button>
     </div>
 
     <!-- Query tab -->
@@ -690,8 +867,10 @@
       <div id="legend">
         <div class="legend-head">
           <div class="lt" id="legend-title"></div>
+          <button class="btn sm" id="btn-set-value" hidden title="Set this property on every element shown">Set value…</button>
           <button class="btn sm" id="btn-clear-query">Clear</button>
         </div>
+        <div id="legend-edit"></div>
         <div class="legend-rows" id="legend-rows"></div>
       </div>
     </div>
@@ -702,10 +881,33 @@
       <div class="check-actions">
         <button class="btn primary" id="btn-run-check" disabled>Select a check</button>
         <button class="btn" id="btn-colour-status" disabled title="Colour the model by check status">Colour</button>
+        <button class="btn" id="btn-to-bcf" disabled title="Turn the findings into BCF issues on the Issues tab">To BCF</button>
+        <button class="btn" id="btn-report" disabled title="Submission readiness report as a PDF">PDF report</button>
       </div>
       <div class="summary" id="summary"></div>
       <div class="scroll" id="issues"></div>
     </div>
+
+    <!-- Issues tab: BCF topics, imported or raised here -->
+    <div id="tab-issues" style="display:none;flex-direction:column;flex:1;overflow:hidden;">
+      <div class="issues-actions">
+        <button class="btn sm" id="btn-bcf-import">Import BCF…</button>
+        <button class="btn sm" id="btn-bcf-new">New topic</button>
+        <span class="spacer"></span>
+        <button class="btn sm primary" id="btn-bcf-export" disabled>Export BCF</button>
+        <input type="file" id="bcf-input" accept=".bcf,.bcfzip,.zip" hidden />
+      </div>
+      <label class="issues-author"><span>Author</span><input id="bcf-author" placeholder="Your name, for comments and new topics" /></label>
+      <div class="scroll" id="bcf-list"><div class="empty-note">No issues yet. Import a BCF from the CORENET X Model Checker, raise a topic on a selected element, or turn check findings into topics with “To BCF” on the Compliance tab.</div></div>
+      <div id="bcf-detail"></div>
+    </div>
+  </div>
+
+  <!-- Edits bar: pending IFC edits and the export that writes them -->
+  <div id="edits-bar">
+    <span class="eb-text" id="edits-text"></span>
+    <button class="btn sm" id="btn-discard-edits" title="Forget every edit">Discard</button>
+    <button class="btn sm primary" id="btn-export-ifc" title="Write the edited IFC file(s)">Export IFC</button>
   </div>
 
   <!-- Tool rail -->
@@ -762,6 +964,7 @@
       <h1>Drop IFC files to check them</h1>
       <p>Drag one or more .ifc files anywhere on this window, or choose them from your computer. Load several to check a federated model. Nothing is uploaded — everything is parsed locally in your browser and checked against the CORENET X IFC-SG mapping.</p>
       <button class="btn primary" id="btn-open-empty">Choose file</button>
+      <div class="start-projects" id="start-projects"></div>
     </div>
   </div>
 

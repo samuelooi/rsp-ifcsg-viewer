@@ -261,8 +261,13 @@ export function buildIndex(api, modelID, ruleset, onProgress = () => {}) {
         objectType: unwrap(line.ObjectType),
         predefinedType: unwrap(line.PredefinedType),
         tag: unwrap(line.Tag),
+        // Spatial elements carry the room name here; Name holds the number.
+        longName: unwrap(line.LongName),
         storey: null,
         psets: {},
+        /** From IfcRelDefinesByType: the type's Name and Tag (Revit's element id). */
+        typeName: null,
+        typeTag: null,
         // Whether the element draws anything itself. Revit exports a stair,
         // roof or curtain wall as a container with no Representation; all the
         // triangles belong to the parts it aggregates (see `parts` below).
@@ -385,6 +390,44 @@ export function buildIndex(api, modelID, ruleset, onProgress = () => {}) {
     return z;
   }
 
+  // ------------------------------------------------------------- types pass
+  // The type an element instances (IfcRelDefinesByType) carries two things the
+  // checks want: its Name, and its Tag, which Revit fills with the element id a
+  // modeller can look up. Types are few and shared, so each is read once.
+  onProgress('Reading element types…', 70);
+  try {
+    const typeCache = new Map();
+    const readType = (id) => {
+      if (typeCache.has(id)) return typeCache.get(id);
+      let info = null;
+      try {
+        const t = api.GetLine(modelID, id, false);
+        info = { name: unwrap(t.Name), tag: unwrap(t.Tag), entity: TYPE_NAMES.get(t.type) || null };
+      } catch { info = null; }
+      typeCache.set(id, info);
+      return info;
+    };
+    const rels = api.GetLineIDsWithType(modelID, WebIFC.IFCRELDEFINESBYTYPE);
+    for (let i = 0; i < rels.size(); i++) {
+      let rel;
+      try {
+        rel = api.GetLine(modelID, rels.get(i), false);
+      } catch {
+        continue;
+      }
+      if (!Array.isArray(rel.RelatedObjects) || !rel.RelatingType) continue;
+      let info = null;
+      for (const h of rel.RelatedObjects) {
+        const el = h && byId.get(h.value);
+        if (!el) continue;
+        if (info === null) info = readType(rel.RelatingType.value) || false;
+        if (!info) break;
+        el.typeName = info.name;
+        el.typeTag = info.tag;
+      }
+    }
+  } catch { /* no type relationships */ }
+
   // An element's "level" must be a storey. Containment can point at any spatial
   // element though — a bin sitting in a room is contained by the IfcSpace, not
   // the storey — so build the spatial hierarchy first and walk up from whatever
@@ -432,6 +475,9 @@ export function buildIndex(api, modelID, ruleset, onProgress = () => {}) {
         storeys.push({
           modelID,
           expressID: id,
+          // Stable across re-exports and renames, so it is part of the model's
+          // identity in a project record (see model-id.js).
+          globalId: unwrap(line.GlobalId),
           name,
           // Millimetres, normalised from whatever the file was authored in.
           elevation: toMm(absolute),
@@ -539,6 +585,28 @@ export function buildIndex(api, modelID, ruleset, onProgress = () => {}) {
     if (!el.storey) el.storey = storeyFor(el.expressID);
   }
 
+  // ------------------------------------------------------------ spatial ids
+  // The GlobalIds of the project, its sites and its buildings. Revit derives
+  // them from element UniqueIds, so they outlive a rename or a re-export and
+  // are what a project record matches a file on (see model-id.js).
+  const spatial = { project: null, sites: [], buildings: [] };
+  const guidsOf = (code) => {
+    const out = [];
+    try {
+      const ids = api.GetLineIDsWithType(modelID, code);
+      for (let i = 0; i < ids.size(); i++) {
+        try {
+          const g = unwrap(api.GetLine(modelID, ids.get(i), false).GlobalId);
+          if (g) out.push(g);
+        } catch { /* unreadable */ }
+      }
+    } catch { /* type absent */ }
+    return out;
+  };
+  spatial.project = guidsOf(WebIFC.IFCPROJECT)[0] || null;
+  spatial.sites = guidsOf(WebIFC.IFCSITE);
+  spatial.buildings = guidsOf(WebIFC.IFCBUILDING);
+
   onProgress('Index ready', 100);
 
   const all = [...byId.values()];
@@ -551,6 +619,7 @@ export function buildIndex(api, modelID, ruleset, onProgress = () => {}) {
     count: all.length,
     georef,
     storeys,
+    spatial,
     // `key` of a part -> `key` of its geometry-less host. Parts that are not
     // themselves indexed (a stair's IfcMember stringers) are only reachable
     // through this, so a click on one can still resolve to the stair.
@@ -574,6 +643,9 @@ export function mergeIndexes(indexes) {
   const georefByModel = new Map(indexes.map((idx) => [idx.modelID, idx.georef]));
   const storeys = indexes.flatMap((idx) => idx.storeys || []);
   const hostOf = new Map();
+  // GlobalId -> element, for BCF topics and anything else that names an
+  // element the way the authorities do.
+  const byGuid = new Map();
 
   for (const idx of indexes) {
     for (const el of idx.all) {
@@ -581,9 +653,10 @@ export function mergeIndexes(indexes) {
       all.push(el);
       if (!byEntity.has(el.canonicalEntity)) byEntity.set(el.canonicalEntity, []);
       byEntity.get(el.canonicalEntity).push(el);
+      if (el.globalId) byGuid.set(el.globalId, el);
     }
     for (const [part, host] of idx.hostOf || []) hostOf.set(part, host);
   }
 
-  return { byId, byEntity, all, count: all.length, georef, georefByModel, storeys, hostOf };
+  return { byId, byEntity, byGuid, all, count: all.length, georef, georefByModel, storeys, hostOf };
 }

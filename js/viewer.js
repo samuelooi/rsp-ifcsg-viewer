@@ -19,7 +19,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { IFCLoader } from 'web-ifc-three/IFCLoader';
 import { convexHull } from './geo/polygon.js';
 
-const WASM_PATH = 'https://unpkg.com/web-ifc@0.0.36/';
+export const WASM_PATH = 'https://unpkg.com/web-ifc@0.0.36/';
 
 /**
  * Store vertex normals as signed bytes instead of floats.
@@ -267,6 +267,9 @@ export class Viewer {
         // Kept because CORENET X caps each submitted file, and the source file
         // is gone by the time a check runs.
         bytes: file.size || 0,
+        // The File itself costs nothing to hold (the browser reads it from disk
+        // on demand) and is what editing and GUID lookup read from later.
+        file,
         mesh,
         baseMaterials,
         ghostMaterials,
@@ -899,6 +902,100 @@ export class Viewer {
   // ------------------------------------------------------------------ camera
 
   /** Union box of everything currently visible, or null if nothing is. */
+  /** Frames a set of elements, using their parts where they draw through parts. */
+  fitElements(elements) {
+    const box = new THREE.Box3();
+    for (const el of elements || []) {
+      for (const p of this.elementPoints(el.modelID, el.expressID, 4000)) box.expandByPoint(p);
+      for (const id of el.parts || []) {
+        for (const p of this.elementPoints(el.modelID, id, 2000)) box.expandByPoint(p);
+      }
+    }
+    if (box.isEmpty()) return false;
+    if (this.activeCamera === this.orthoCamera) this.exitPlanView();
+    const size = box.getSize(new THREE.Vector3());
+    const center = box.getCenter(new THREE.Vector3());
+    const dist = Math.max(Math.max(size.x, size.y, size.z), 2) * 1.8;
+    const dir = new THREE.Vector3().subVectors(this.camera.position, this.controls.target);
+    if (dir.lengthSq() < 1e-6) dir.set(1, 0.75, 1);
+    dir.normalize();
+    this.camera.position.copy(center).addScaledVector(dir, dist);
+    this.controls.target.copy(center);
+    this.controls.update();
+    return true;
+  }
+
+  /**
+   * The current camera as a BCF viewpoint: IFC project coordinates, metres,
+   * Z up. The scene is `M · (x, z, -y)` of those (see geo/georef.js), so this
+   * undoes the re-centring and the axis swap.
+   */
+  cameraViewpoint() {
+    const Minv = (this.coordinationMatrix || new THREE.Matrix4()).clone().invert();
+    const toIfc = (v) => {
+      const s = v.clone().applyMatrix4(Minv);
+      return { x: s.x, y: -s.z, z: s.y };
+    };
+    const toIfcDir = (v) => {
+      const s = v.clone().transformDirection(Minv);
+      return { x: s.x, y: -s.z, z: s.y };
+    };
+    const cam = this.activeCamera;
+    const direction = new THREE.Vector3();
+    cam.getWorldDirection(direction);
+    // The camera's own Y axis in world space is its true up, whatever `up` was set to.
+    const up = new THREE.Vector3(0, 1, 0).applyQuaternion(cam.quaternion).normalize();
+    if (cam === this.orthoCamera) {
+      return {
+        type: 'orthogonal', position: toIfc(cam.position), direction: toIfcDir(direction),
+        up: toIfcDir(up), scale: (cam.top - cam.bottom) || 1,
+      };
+    }
+    return {
+      type: 'perspective', position: toIfc(cam.position), direction: toIfcDir(direction),
+      up: toIfcDir(up), fov: cam.fov,
+    };
+  }
+
+  /** Moves the camera to a BCF viewpoint (the inverse of cameraViewpoint). */
+  setViewpoint(vp) {
+    if (!vp || !vp.position || !vp.direction) return false;
+    const M = this.coordinationMatrix || new THREE.Matrix4();
+    const fromIfc = (p) => new THREE.Vector3(p.x, p.z, -p.y).applyMatrix4(M);
+    const fromIfcDir = (p) => new THREE.Vector3(p.x, p.z, -p.y).transformDirection(M).normalize();
+    if (this.activeCamera === this.orthoCamera) this.exitPlanView();
+    const position = fromIfc(vp.position);
+    const direction = fromIfcDir(vp.direction);
+    if (!Number.isFinite(position.x) || direction.lengthSq() < 1e-9) return false;
+    this.camera.position.copy(position);
+    if (vp.up) this.camera.up.copy(fromIfcDir(vp.up));
+    if (vp.fov) this.camera.fov = vp.fov;
+    this.camera.updateProjectionMatrix();
+    // OrbitControls orbits about its target; put it a model's width ahead.
+    const box = this._visibleBox();
+    const reach = box ? box.getSize(new THREE.Vector3()).length() * 0.5 : 20;
+    this.controls.target.copy(position).addScaledVector(direction, reach);
+    this.controls.update();
+    return true;
+  }
+
+  /** A PNG of the current view, rendered fresh so the buffer is populated. */
+  snapshot(maxWidth = 1280, type = 'image/png', quality = 0.85) {
+    this.renderer.render(this.scene, this.activeCamera);
+    const src = this.renderer.domElement;
+    const scale = Math.min(1, maxWidth / src.width);
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(src.width * scale);
+    canvas.height = Math.round(src.height * scale);
+    const ctx = canvas.getContext('2d');
+    // JPEG has no alpha: paint the scene background first so nothing goes black.
+    ctx.fillStyle = '#' + this.scene.background.getHexString();
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(src, 0, 0, canvas.width, canvas.height);
+    return new Promise((resolve) => canvas.toBlob((blob) =>
+      resolve(blob ? Object.assign(blob, { width: canvas.width, height: canvas.height }) : null), type, quality));
+  }
+
   _visibleBox() {
     const box = new THREE.Box3();
     let any = false;
