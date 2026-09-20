@@ -38,10 +38,14 @@ export function emptyProject() {
     submission: { gateway: 'construction', authorities: [] },
     checks: { selected: null, inputs: {}, presets: null },
     /**
-     * One record per model that has been checked, keyed by the model's own
-     * content rather than its file name (see model-id.js). Holds the dashboard
-     * quantities, the per-check results and the findings, so the numbers for a
-     * whole submission can be assembled without every file being open at once.
+     * One record per model, keyed by the model's own content rather than its
+     * file name (see model-id.js). Holds the dashboard quantities with the
+     * breakdowns behind them, the per-check results and the findings.
+     *
+     * These records, not the loaded files, are what the dashboard totals: a
+     * model's quantities are extracted when it loads and reported from here
+     * afterwards, so a federated submission adds up whether it is opened all
+     * at once, one file at a time, or not at all.
      */
     models: [],
     ruleset: { generated: null },

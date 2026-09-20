@@ -81,6 +81,16 @@ export function toStepValue(input, { dataType = null, existing = null } = {}) {
 /** Case-insensitive name match, as the checks do. */
 const same = (a, b) => String(a || '').trim().toUpperCase() === String(b || '').trim().toUpperCase();
 
+const CR = 0x0d, NL = 0x0a;
+
+/** Bytes of line terminator (0, 1 or 2) actually present at a file offset. */
+async function eolLengthAt(file, offset) {
+  const bytes = new Uint8Array(await file.slice(offset, Math.min(file.size, offset + 2)).arrayBuffer());
+  if (bytes[0] === CR && bytes[1] === NL) return 2;
+  if (bytes[0] === NL || bytes[0] === CR) return 1;
+  return 0;
+}
+
 export class IfcEditor {
   /**
    * @param {File} file        the IFC as loaded
@@ -473,9 +483,9 @@ export class IfcEditor {
   /**
    * The edited file. Original bytes are sliced around the changed lines, so
    * memory is a few parts, not a second copy of the file.
-   * @returns {Blob}
+   * @returns {Promise<Blob>}
    */
-  export() {
+  async export() {
     const scan = this.scan;
     const file = this.file;
     const enc = new TextEncoder();
@@ -491,7 +501,11 @@ export class IfcEditor {
       const start = scan.starts[c.id];
       let end = scan.ends[c.id];
       // Take the line terminator with a deleted line so no blank line is left.
-      if (c.text === null) end = Math.min(file.size, end + this.eol.length);
+      // Read from the file rather than assume the file-wide guess, since a
+      // mismatched guess (e.g. a file with mixed CRLF/LF) would eat one byte
+      // too many -- the start of whatever follows, including ENDSEC itself
+      // when the deleted line was last in the DATA section.
+      if (c.text === null) end = Math.min(file.size, end + await eolLengthAt(file, end));
       if (start > cursor) parts.push(file.slice(cursor, start));
       if (c.text !== null) parts.push(enc.encode(c.text));
       cursor = end;
@@ -502,7 +516,7 @@ export class IfcEditor {
       if (at > cursor) parts.push(file.slice(cursor, at));
       const lines = [...this.created].sort((a, b) => a - b).map((id) => serialiseLine(this.lines.get(id)));
       parts.push(enc.encode(lines.join(this.eol) + this.eol));
-      cursor = at;
+      cursor = Math.max(cursor, at);
     }
     if (cursor < file.size) parts.push(file.slice(cursor));
     return new Blob(parts, { type: 'application/octet-stream' });

@@ -11,7 +11,7 @@
 
 import { Viewer } from './viewer.js';
 import { buildIndex, mergeIndexes } from './ifc-index.js';
-import { DASHBOARD_ENTITIES, computeDashboard, formatValue as fmtNum } from './dashboard.js';
+import { DASHBOARD_ENTITIES, computeDashboard, formatValue as fmtNum, METRICS as DASHBOARD_METRICS } from './dashboard.js';
 import { measure, project as projectMemory, formatBytes, LEVEL } from './memory.js';
 import {
   loadRuleset, selectElements, groupByValue, runCheck, evaluate, getValue,
@@ -695,11 +695,35 @@ async function loadFiles(files) {
     return;
   }
 
+  // Extract what each model reports and write it into the project before
+  // anything else: these are the figures the dashboard totals, and they have
+  // to outlive the file being unloaded. Recorded check results are left
+  // alone (see buildModelRecord).
+  try {
+    captureModelRecords();
+  } catch (err) {
+    console.error('The models could not be recorded in the project:', err);
+  }
   rebuildIndex();
   viewer.fit();
   setProgress(100, 'Done');
   if (skipped) toast(`${skipped} file${skipped > 1 ? 's were' : ' was'} skipped — not .ifc.`);
   setTimeout(() => el.loading.classList.remove('visible'), 250);
+}
+
+/**
+ * Enables the Dashboard button whenever there is something to show in it —
+ * a loaded model or a project with recorded ones — and keeps an open
+ * dashboard in step with the model set. Unloading a file does not change the
+ * totals; it only changes which of them can be highlighted in the 3D view.
+ */
+function refreshDashboardAvailability() {
+  const hasRecords = !!(project && project.models && project.models.length);
+  const loaded = !!(viewer && viewer.hasModels);
+  el.btnDash.disabled = !loaded && !hasRecords;
+  if (!el.dash.classList.contains('visible')) return;
+  if (loaded || hasRecords) openDashboard();
+  else el.dash.classList.remove('visible');
 }
 
 /** Recomputes the merged index, target counts and all dependent UI. */
@@ -725,8 +749,9 @@ function rebuildIndex() {
   el.btnReset.disabled = !viewer.hasModels;
   // Check inputs such as the preset editor read from the index, so redraw them.
   renderCheckMenu();
-  el.btnDash.disabled = !index;
-  if (!index) el.dash.classList.remove('visible');
+  // The dashboard reports the project, not the session: what a file measured
+  // stays in the record when it is unloaded.
+  refreshDashboardAvailability();
 
   renderModels();
   renderTree();
@@ -1787,16 +1812,124 @@ function colourByStatus() {
 
 let dashResult = null;
 
+/** Sums recorded breakdown rows into a map keyed by label. */
+function addRows(into, rows) {
+  for (const r of rows || []) {
+    const row = into.get(r.label) || { label: r.label, value: 0, count: 0 };
+    row.value += r.value || 0;
+    row.count += r.count || 0;
+    into.set(r.label, row);
+  }
+}
+
+const byValueDesc = (a, b) => b.value - a.value || b.count - a.count || a.label.localeCompare(b.label);
+
+/** File names ascending, numeric-aware so ...-9 sorts before ...-10. */
+const byFileName = (a, b) => a.label.localeCompare(b.label, undefined, { numeric: true, sensitivity: 'base' });
+
+/**
+ * The dashboard, assembled from what the project has recorded for every model
+ * — the totals a submission reports, whether or not the files are open.
+ *
+ * The record is the source of truth: each model's quantities are extracted
+ * when it loads (see buildModelRecord) and stay in the project file, so
+ * unloading a file takes its geometry out of the viewer without taking its
+ * area out of the total. A currently loaded model's live metric is carried
+ * alongside as `live`, which is all that "Show in model" needs.
+ *
+ * @param {object|null} liveDash  the dashboard of the loaded models, or null
+ */
+function computeProjectDashboard(liveDash) {
+  const records = (project && project.models) || [];
+  const liveById = new Map((liveDash ? liveDash.metrics : []).map((m) => [m.id, m]));
+
+  const metrics = DASHBOARD_METRICS.map((spec) => {
+    const byFile = [];
+    const byLevel = new Map();
+    const byType = new Map();
+    const subtotals = new Map();
+    const sources = new Set();
+    const near = new Map();
+    let total = 0;
+    let count = 0;
+    let candidates = 0;
+    let missingValue = 0;
+
+    for (const r of records) {
+      const m = (r.dashboard || []).find((x) => x.id === spec.id);
+      if (!m) continue;
+      total += m.total || 0;
+      count += m.count || 0;
+      candidates += m.candidates || 0;
+      missingValue += m.missingValue || 0;
+      for (const s of m.valueSources || []) sources.add(s);
+      if (m.count) byFile.push({ label: r.name, value: m.total || 0, count: m.count });
+      addRows(byLevel, m.byLevel);
+      addRows(byType, m.byType);
+      addRows(subtotals, m.subtotals);
+      for (const n of m.nearMisses || []) near.set(n.label, (near.get(n.label) || 0) + n.count);
+    }
+
+    return {
+      id: spec.id, title: spec.title, entity: spec.entity, unit: spec.unit, decimals: spec.decimals,
+      source: spec.source, note: spec.note || null, whereLabel: spec.whereLabel || null,
+      isCount: !spec.measure,
+      candidates, present: count > 0, count, total, missingValue,
+      valueSources: [...sources],
+      // Declared order, so a subtotal a file never reported still reads as zero
+      // rather than disappearing.
+      subtotals: (spec.subtotals || []).map((s) =>
+        subtotals.get(s.label) || { label: s.label, value: 0, count: 0 }),
+      nearMisses: count ? [] : [...near.entries()].map(([label, n]) => ({ label, count: n }))
+        .sort((a, b) => b.count - a.count),
+      byType: [...byType.values()].sort(byValueDesc),
+      // Files read as a list of submitted drawings, so they keep their own
+      // order rather than being ranked by size.
+      byFile: byFile.sort(byFileName),
+      byLevel: [...byLevel.values()].sort(byValueDesc),
+      live: liveById.get(spec.id) || null,
+    };
+  });
+
+  const missing = metrics.filter((m) => !m.present);
+  const incomplete = metrics.filter((m) => m.present && m.missingValue > 0);
+  return {
+    metrics,
+    summary: {
+      total: metrics.length,
+      present: metrics.length - missing.length,
+      missing: missing.map((m) => m.title),
+      incomplete: incomplete.map((m) => ({ title: m.title, missing: m.missingValue, of: m.count })),
+    },
+  };
+}
+
 function openDashboard() {
-  if (!index) {
+  // Recording first means an open dashboard always reflects what is loaded
+  // now, including any property edits made since the file was opened.
+  if (viewer.hasModels) {
+    try {
+      captureModelRecords();
+    } catch (err) {
+      console.error('The models could not be recorded in the project:', err);
+    }
+  }
+  const records = (project && project.models) || [];
+  if (!records.length) {
     toast('Load an IFC model first.');
     return;
   }
-  const names = new Map(viewer.entries.map((e) => [e.modelID, e.name]));
-  dashResult = computeDashboard(index, names);
+
+  const liveDash = index
+    ? computeDashboard(index, new Map(viewer.entries.map((e) => [e.modelID, e.name])))
+    : null;
+  dashResult = computeProjectDashboard(liveDash);
+
+  const loaded = viewer.entries.length;
+  const unloaded = records.length - loaded;
   el.dashSub.textContent =
-    `${viewer.entries.length} model${viewer.entries.length > 1 ? 's' : ''} · ` +
-    `${index.count.toLocaleString()} indexed elements · ` +
+    `${records.length} model${records.length > 1 ? 's' : ''} in the project · ` +
+    (unloaded > 0 ? `${loaded} loaded, ${unloaded} from the project record · ` : 'all loaded · ') +
     `${dashResult.summary.present} of ${dashResult.summary.total} metrics found`;
   renderDashboard();
   el.dash.classList.add('visible');
@@ -1807,11 +1940,21 @@ function renderDashboard() {
   const { metrics, summary } = dashResult;
   const parts = [];
 
-  // Compliance: anything the federated model does not contain at all.
+  const unloaded = ((project && project.models) || []).length - viewer.entries.length;
+  if (unloaded > 0) {
+    parts.push(`
+      <div class="dash-alert">
+        <b>${unloaded} model${unloaded > 1 ? 's are' : ' is'} not loaded —</b> ${unloaded > 1 ? 'their' : 'its'}
+        quantities are counted from the project record, taken when the file was last open.
+        Load the file again to highlight its elements in the 3D view.
+      </div>`);
+  }
+
+  // Compliance: anything the submission does not contain at all.
   if (summary.missing.length) {
     parts.push(`
       <div class="dash-alert">
-        <b>Not present in the federated model —</b> ${summary.missing.length} of
+        <b>Not present in the submission —</b> ${summary.missing.length} of
         ${summary.total} reported quantities have no matching elements.
         <ul>${summary.missing.map((m) => `<li>${esc(m)}</li>`).join('')}</ul>
       </div>`);
@@ -1861,7 +2004,7 @@ function renderDashboard() {
           <table class="brk" style="margin-top:6px">${m.nearMisses.map((n) =>
             `<tr><td class="k">${esc(n.label)}</td><td class="c">${n.count}</td></tr>`).join('')}</table>`);
       } else {
-        parts.push(`Nothing in the loaded models matches this definition. Either the
+        parts.push(`Nothing in the project's models matches this definition. Either the
           elements are not modelled, or their ObjectType is not set as the mapping requires.`);
       }
       parts.push('</div>');
@@ -1898,8 +2041,14 @@ function renderDashboard() {
         parts.push('</table>');
       }
       parts.push('</div>');
-      parts.push(`<div class="card-actions">
-        <button class="btn sm" data-act="show">Show in model</button></div>`);
+      // Only the loaded part of a metric can be highlighted: the record holds
+      // the figures, never the elements they were measured from.
+      if (m.live && m.live.count) {
+        parts.push(`<div class="card-actions">
+          <button class="btn sm" data-act="show">Show in model${
+            m.live.count < m.count ? ` (${m.live.count} of ${m.count} loaded)` : ''
+          }</button></div>`);
+      }
     }
 
     const srcBits = [m.source];
@@ -1914,7 +2063,7 @@ function renderDashboard() {
   el.dashBody.querySelectorAll('[data-act="show"]').forEach((b) => {
     b.addEventListener('click', () => {
       const m = metrics.find((x) => x.id === b.closest('.card').dataset.m);
-      if (m) showMetricInModel(m);
+      if (m && m.live) showMetricInModel(m.live);
     });
   });
 }
@@ -2220,6 +2369,7 @@ async function applyProject(p, { handle = null, quiet = false } = {}) {
   refreshFilters();
   renderCheckMenu();
   renderStartProjects();
+  refreshDashboardAvailability();
 
   if (!quiet) toast(`Project ${labelOf(p)} loaded.`);
   if (unknown.length) toast(`Checks the project names but this viewer lacks were ignored: ${unknown.join(', ')}.`);
@@ -2292,6 +2442,7 @@ function newProject() {
   projectSavedFp = null;
   clearLastProject();
   renderProjectChip();
+  refreshDashboardAvailability();
   openProjectPanel(true);
 }
 
@@ -2502,6 +2653,7 @@ function renderProjectPanel() {
       project.models = project.models.filter((m) => m !== row.record);
       renderProjectPanel();
       renderProjectChip();
+      refreshDashboardAvailability();
     });
   });
 
@@ -2764,7 +2916,7 @@ async function exportEdits() {
         toast(`${ed.name}: the edited lines did not validate — ${check.problems[0]}`);
         continue;
       }
-      const blob = ed.export();
+      const blob = await ed.export();
       await saveBlob(blob, ed.exportName, [{ description: 'IFC', accept: { 'application/octet-stream': ['.ifc'] } }]);
       toast(`${ed.exportName} written (${ed.editCount} edit${ed.editCount === 1 ? '' : 's'}).`);
     }
@@ -3163,25 +3315,37 @@ const STATE_LABEL = {
   [RECORD_STATE.LEGACY]: 'Expected',
 };
 
-/** The per-model dashboard rows, from the merged dashboard's per-file split. */
-function dashboardForModel(dash, name) {
+/** A breakdown row without its element references, which cannot be written to a file. */
+const recordedRow = (r) => ({ label: r.label, value: r.value, count: r.count });
+
+/**
+ * One model's dashboard, as recorded in the project: every quantity the card
+ * shows, plus the breakdowns behind it, so the dashboard can be rebuilt from
+ * the project file alone once the model is no longer loaded. Only the element
+ * references are dropped — those live and die with the wasm index.
+ * @param {object|null} dash  the dashboard computed for this model alone
+ */
+function dashboardForModel(dash) {
   if (!dash) return [];
-  return dash.metrics.map((m) => {
-    const row = m.byFile.find((r) => r.label === name);
-    return {
-      id: m.id, title: m.title, unit: m.unit, decimals: m.decimals, isCount: m.isCount,
-      total: row ? row.value : 0, count: row ? row.count : 0,
-    };
-  });
+  return dash.metrics.map((m) => ({
+    id: m.id, title: m.title, unit: m.unit, decimals: m.decimals, isCount: m.isCount,
+    total: m.total, count: m.count, candidates: m.candidates, missingValue: m.missingValue,
+    valueSources: m.valueSources,
+    subtotals: m.subtotals.map(recordedRow),
+    byType: m.byType.map(recordedRow),
+    byLevel: m.byLevel.map(recordedRow),
+    nearMisses: m.nearMisses,
+  }));
 }
 
 /**
- * One model's record, built from the last check run.
+ * One model's record: current dashboard quantities always, check results
+ * from the last run when there was one (kept from `prev` otherwise, so a
+ * capture on load or on opening the dashboard cannot erase a prior run).
  * @param {object} entry     the viewer entry
  * @param {object|null} prev an existing record to update in place
- * @param {object|null} dash the merged dashboard, computed once per capture
  */
-function buildModelRecord(entry, prev, dash) {
+function buildModelRecord(entry, prev) {
   const idx = indexes.get(entry.modelID);
   const identity = identities.get(entry.modelID) || (prev && prev.identity) || null;
   // A finding about the submission rather than an element (file size, levels
@@ -3189,9 +3353,18 @@ function buildModelRecord(entry, prev, dash) {
   // that file was the only one open.
   const alone = viewer.entries.length === 1;
 
-  const checks = [];
-  const findings = [];
+  let checks = [];
+  let findings = [];
   let truncated = 0;
+
+  // A capture triggered by loading or by opening the dashboard, rather than
+  // by a check run, has no fresh outcomes to draw from. Keep whatever was
+  // last recorded instead of wiping it out — only an actual run replaces it.
+  if (!checkOutcomes.length && prev) {
+    checks = [...(prev.checks || [])];
+    findings = [...(prev.findings || [])];
+    truncated = prev.findingsTruncated || 0;
+  }
 
   for (const o of checkOutcomes) {
     const meta = o.meta || registry.byId(o.id);
@@ -3258,7 +3431,10 @@ function buildModelRecord(entry, prev, dash) {
       crs: g.crs ? g.crs.name || null : null,
       lengthUnit: g.lengthUnitName || null,
     } : null,
-    dashboard: dashboardForModel(dash, entry.name),
+    // Computed against this model's own index, so the figures belong to this
+    // file alone and stay correct however the federated set is composed.
+    dashboard: idx ? dashboardForModel(computeDashboard(idx, new Map([[entry.modelID, entry.name]])))
+      : (prev ? prev.dashboard : []),
     checks,
     findings,
     findingsTruncated: truncated,
@@ -3274,7 +3450,6 @@ function buildModelRecord(entry, prev, dash) {
 function captureModelRecords() {
   if (!viewer.hasModels) return 0;
   if (!project) project = emptyProject();
-  const dash = index ? computeDashboard(index, new Map(viewer.entries.map((e) => [e.modelID, e.name]))) : null;
 
   const records = project.models ? [...project.models] : [];
   // One record per file: a record already claimed by an earlier file in this
@@ -3290,7 +3465,7 @@ function captureModelRecords() {
     const legacy = !hit.record && records.find((r) => r.legacy && !claimed.has(r) && r.name === entry.name);
     const prev = hit.record || legacy || null;
     if (prev) claimed.add(prev);
-    const record = buildModelRecord(entry, prev, dash);
+    const record = buildModelRecord(entry, prev);
     const at = prev ? records.indexOf(prev) : -1;
     if (at >= 0) records[at] = record;
     else records.push(record);
@@ -3391,21 +3566,6 @@ function submissionTotals() {
     oldest: dates[0] || null,
     newest: dates[dates.length - 1] || null,
   };
-}
-
-/** Dashboard metrics summed across every record, for the whole submission. */
-function submissionDashboard() {
-  const rows = new Map();
-  for (const r of (project && project.models) || []) {
-    for (const m of r.dashboard || []) {
-      let row = rows.get(m.id);
-      if (!row) rows.set(m.id, (row = { id: m.id, title: m.title, unit: m.unit, decimals: m.decimals, isCount: m.isCount, total: 0, count: 0, files: 0 }));
-      row.total += m.total || 0;
-      row.count += m.count || 0;
-      if (m.count) row.files++;
-    }
-  }
-  return [...rows.values()];
 }
 
 // ------------------------------------------------------------ readiness report
