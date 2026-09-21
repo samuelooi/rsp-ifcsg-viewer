@@ -150,9 +150,34 @@ const METRICS = [
     entity: 'IFCSPACE',
     subtypes: ['*AREA_GFA'],
     where: (el) => isTrue(getValue(el, 'SGPset_SpaceArea_Verification', 'AVF_IncludeAsGFA')),
+    // Named separately from the closure above so a zero total can be explained:
+    // did the property come back false, or is it simply not on the element?
+    wherePset: 'SGPset_SpaceArea_Verification',
+    whereProp: 'AVF_IncludeAsGFA',
     whereLabel: 'AVF_IncludeAsGFA = True',
     measure: SPACE_AREA,
     source: 'IfcSpace · ObjectType AREA_GFA · SGPset_SpaceArea_Verification.AVF_IncludeAsGFA',
+  },
+  {
+    // Every AREA_GFA space, verified or not — GFA above is the subset of this
+    // that has actually been through the AVF_IncludeAsGFA check. A model where
+    // that check was never run shows GFA = 0 and SGFA = the true submitted
+    // total, which is the signal that the check is outstanding rather than
+    // that no floor area was modelled.
+    id: 'sgfa',
+    title: 'SGFA',
+    unit: 'm²',
+    decimals: 2,
+    entity: 'IFCSPACE',
+    subtypes: ['*AREA_GFA'],
+    measure: SPACE_AREA,
+    subtotals: [
+      { label: 'Verified (AVF_IncludeAsGFA = True)', when: (el) => isTrue(getValue(el, 'SGPset_SpaceArea_Verification', 'AVF_IncludeAsGFA')) },
+      { label: 'Not yet verified', when: (el) => !isTrue(getValue(el, 'SGPset_SpaceArea_Verification', 'AVF_IncludeAsGFA')) },
+    ],
+    note: 'Every space typed AREA_GFA, whether or not it has passed the AVF_IncludeAsGFA ' +
+      'verification check — the same population as Gross Floor Area, less that one filter.',
+    source: 'IfcSpace · ObjectType AREA_GFA · SGPset_SpaceDimension.Area (GFA plus unverified AREA_GFA space)',
   },
   {
     id: 'planting',
@@ -279,6 +304,21 @@ export function computeDashboard(index, modelNames = new Map()) {
       });
     }
 
+    // The subtype matched but the `where` filter dropped every candidate: a
+    // silent zero here looks identical to "nothing modelled", which it is not.
+    // Distinguishing "the property is missing" from "the property is false"
+    // tells the architect whether this is a verification step nobody ran yet
+    // or a deliberate exclusion.
+    let whereExcluded = null;
+    if (spec.where && matched.length > 0 && elements.length === 0) {
+      let missingProperty = 0;
+      for (const el of matched) {
+        const v = spec.wherePset ? getValue(el, spec.wherePset, spec.whereProp) : undefined;
+        if (v === undefined || v === null || String(v).trim() === '') missingProperty++;
+      }
+      whereExcluded = { total: matched.length, missingProperty };
+    }
+
     return {
       id: spec.id,
       title: spec.title,
@@ -294,6 +334,7 @@ export function computeDashboard(index, modelNames = new Map()) {
       candidates: matched.length,
       present: elements.length > 0,
       nearMisses: elements.length ? [] : nearMisses(pool, spec.subtypes),
+      whereExcluded,
       count: elements.length,
       total,
       missingValue,

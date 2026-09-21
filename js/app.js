@@ -11,6 +11,7 @@
 
 import { Viewer } from './viewer.js';
 import { buildIndex, mergeIndexes } from './ifc-index.js';
+import { flattenArcs } from './ifc-arc-fix.js';
 import { DASHBOARD_ENTITIES, computeDashboard, formatValue as fmtNum } from './dashboard.js';
 import { measure, project as projectMemory, formatBytes, LEVEL } from './memory.js';
 import {
@@ -655,8 +656,33 @@ async function loadFiles(files) {
     setProgress(base + span * 0.05, `Reading ${file.name}…`);
 
     try {
-      const entry = await viewer.load(file, (pct) =>
-        setProgress(base + span * (pct / 100) * 0.6, `Parsing geometry${label}…`));
+      // A rounded corner in a floor or geographic-element boundary is stored as
+      // an arc that web-ifc cannot tessellate (see js/ifc-arc-fix.js) — most of
+      // the solid's footprint would silently go missing. Straighten any such
+      // arcs into a dense polyline before web-ifc ever parses the file. Only
+      // this in-memory copy is affected: entry.file below is put back to the
+      // real upload once parsing is done, so editing, export and identity
+      // still see the bytes the user actually gave us.
+      let loadFile = file;
+      try {
+        const fixed = await flattenArcs(file, (pct) =>
+          setProgress(base + span * 0.02 + span * 0.08 * (pct / 100), `Checking curved boundaries${label}…`));
+        if (fixed.file) {
+          loadFile = fixed.file;
+          console.info(`${file.name}: straightened ${fixed.arcsFixed} curved boundary ` +
+            `segment${fixed.arcsFixed === 1 ? '' : 's'} in ${fixed.curvesFixed} profile` +
+            `${fixed.curvesFixed === 1 ? '' : 's'} so web-ifc can draw them.`);
+        }
+      } catch (err) {
+        console.warn(`Could not check ${file.name} for curved boundaries; loading as-is.`, err);
+      }
+
+      const entry = await viewer.load(loadFile, (pct) =>
+        setProgress(base + span * 0.1 + span * (pct / 100) * 0.5, `Parsing geometry${label}…`));
+      // Restore the real upload: everything past this point (editing, export,
+      // GUID/identity reads) must see the original bytes, not our patched copy.
+      entry.file = file;
+      entry.bytes = file.size || 0;
 
       if (ruleset) {
         setProgress(base + span * 0.65, `Indexing properties${label}…`);
@@ -1853,7 +1879,20 @@ function renderDashboard() {
 
     if (!m.present) {
       parts.push('<div class="card-empty">');
-      if (m.nearMisses.length) {
+      if (m.whereExcluded) {
+        // Matched the subtype fine — the `where` filter is what zeroed it out.
+        // Missing entirely vs. set false changes what the architect does next.
+        const { total, missingProperty } = m.whereExcluded;
+        parts.push(`${total} element${total > 1 ? 's' : ''} matched the mapping's subtype, but
+          every one was excluded by <code>${esc(m.whereLabel || 'the filter')}</code>. ${
+          missingProperty === total
+            ? `None of them carry that property at all — this looks like a verification ` +
+              `step that has not been run yet, not an absence of floor area.`
+            : missingProperty > 0
+              ? `${missingProperty} of them do not carry the property at all; the rest have it set to false.`
+              : `All of them have the property explicitly set to false.`
+        }`);
+      } else if (m.nearMisses.length) {
         // The elements exist but are typed differently — that is a finding, not
         // an absence, and the distinction changes what the architect does next.
         parts.push(`Nothing matches the mapping's subtype, but similarly named
