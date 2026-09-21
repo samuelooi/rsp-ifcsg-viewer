@@ -81,15 +81,18 @@ function isTrue(v) {
 }
 
 /**
- * First numeric value found among candidate `[pset, property]` pairs.
+ * First numeric value found among candidate `[pset, property, scale]` entries.
+ * `scale` converts a candidate authored in another unit onto the metric's own,
+ * and is reported in the source so a converted figure is never silent.
  * @returns {{value: number, source: string}|null}
  */
 function firstNumber(el, candidates) {
-  for (const [pset, prop] of candidates) {
+  for (const [pset, prop, scale = 1] of candidates) {
     const v = getValue(el, pset, prop);
     if (v === undefined || v === null || String(v).trim() === '') continue;
     const n = Number(v);
-    if (Number.isFinite(n)) return { value: n, source: `${pset}.${prop}` };
+    if (!Number.isFinite(n)) continue;
+    return { value: n * scale, source: `${pset}.${prop}${scale === 1 ? '' : ` ×${scale}`}` };
   }
   return null;
 }
@@ -124,6 +127,10 @@ const REFUSE_EQUIPMENT = [
   '*REFUSECONTAINER', '*REFUSECOMPACTOR', '*RECYCLABLECONTAINER',
   '*RECYCLABLECOMPACTOR', '*REFUSEHANDLINGEQUIPMENT',
 ];
+const REFUSE_ALL = [...REFUSE_BINS, ...REFUSE_EQUIPMENT];
+
+/** Bins are authored in litres, handling equipment as a volume. One unit wins. */
+const M3_TO_LITRE = 1000;
 
 const TITLE_CASE = {
   CARLOT: 'Car', MOTORCYCLELOT: 'Motorcycle', LORRYLOT: 'Lorry',
@@ -141,7 +148,7 @@ const pretty = (k) => TITLE_CASE[k] || k;
  * `measure: null` counts elements; otherwise it sums the first numeric value
  * found among `candidates`.
  */
-const METRICS = [
+export const METRICS = [
   {
     id: 'gfa',
     title: 'Gross Floor Area',
@@ -207,26 +214,24 @@ const METRICS = [
     source: 'IfcBuildingElementProxy · *CARLOT, *MOTORCYCLELOT, *LORRYLOT, *COACHLOT, *ARTICULATEDVEHICLELOT, *BICYCLELOT',
   },
   {
-    id: 'refuse-bins',
-    title: 'Refuse & Recycling Bins',
+    id: 'refuse',
+    title: 'Refuse & Recycling Capacity',
     unit: 'L',
     decimals: 0,
     entity: 'IFCTANK',
-    subtypes: REFUSE_BINS,
-    measure: [['SGPset_Tank', 'Litre']],
-    splitByType: REFUSE_BINS,
-    source: 'IfcTank · *RECYCLINGBIN, *REFUSEBIN · SGPset_Tank.Litre',
-  },
-  {
-    id: 'refuse-equipment',
-    title: 'Refuse Handling Equipment',
-    unit: 'm³',
-    decimals: 2,
-    entity: 'IFCTANK',
-    subtypes: REFUSE_EQUIPMENT,
-    measure: [['Pset_TankTypeCommon', 'NominalCapacity'], ['SGPset_Tank', 'NominalCapacity']],
-    splitByType: REFUSE_EQUIPMENT,
-    source: 'IfcTank · *REFUSECONTAINER, *REFUSECOMPACTOR, *RECYCLABLECONTAINER, *RECYCLABLECOMPACTOR, *REFUSEHANDLINGEQUIPMENT · Pset_TankTypeCommon.NominalCapacity',
+    subtypes: REFUSE_ALL,
+    // Bins carry their capacity in litres; handling equipment declares a
+    // NominalCapacity volume in m³. Converting the latter lets one total cover
+    // both, and the BY TYPE split keeps the two readable apart.
+    measure: [
+      ['SGPset_Tank', 'Litre'],
+      ['Pset_TankTypeCommon', 'NominalCapacity', M3_TO_LITRE],
+      ['SGPset_Tank', 'NominalCapacity', M3_TO_LITRE],
+    ],
+    splitByType: REFUSE_ALL,
+    source: 'IfcTank · *RECYCLINGBIN, *REFUSEBIN · SGPset_Tank.Litre — ' +
+      '*REFUSECONTAINER, *REFUSECOMPACTOR, *RECYCLABLECONTAINER, *RECYCLABLECOMPACTOR, ' +
+      '*REFUSEHANDLINGEQUIPMENT · Pset_TankTypeCommon.NominalCapacity (m³, converted to litres)',
   },
   {
     id: 'site-coverage',
